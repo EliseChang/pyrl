@@ -46,6 +46,15 @@ class Recurrent(object):
     def get_values(self):
         return OrderedDict([(k, v.get_value()) for k, v in self.params.items()])
 
+    def set_values(self, values):
+        """
+        Overwrite the parameters in place. Since these are shared variables, any
+        already-compiled Theano function picks up the new values without recompilation.
+
+        """
+        for k, v in values.items():
+            self.params[k].set_value(np.asarray(v, theano.config.floatX))
+
     def get(self, name):
         p = self.params[name]
         if name in self.masks:

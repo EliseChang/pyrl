@@ -1422,22 +1422,22 @@ def psychometric(trialsfile, plots=None, **kwargs):
 #/////////////////////////////////////////////////////////////////////////////////////////
 
 def performance(savefile, plot, **kwargs):
-    perf_history = utils.load(savefile)['perf_history']
+    training_history = utils.load(savefile)['training_history']
 
     all_trials    = []
     all_corrects  = []
     best_trials   = []
     best_corrects = []
-    for niters, ntrials, perf, is_best in perf_history:
-        if is_best:
-            if perf.n_decision > 0:
-                p_correct = perf.n_correct/perf.n_decision
-                best_trials.append(ntrials)
-                best_corrects.append(p_correct)
+    for record in training_history:
+        ntrials = record['n_trials']
+        perf    = record['perf']
         if perf.n_decision > 0:
             p_correct = perf.n_correct/perf.n_decision
             all_trials.append(ntrials)
             all_corrects.append(p_correct)
+            if record['new_best']:
+                best_trials.append(ntrials)
+                best_corrects.append(p_correct)
 
     all_trials    = np.asarray(all_trials)
     all_corrects  = np.asarray(all_corrects)

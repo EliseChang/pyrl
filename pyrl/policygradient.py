@@ -2,6 +2,7 @@ from __future__ import absolute_import, division
 
 from   collections import OrderedDict
 import datetime
+import os
 import sys
 
 import numpy as np
@@ -29,6 +30,7 @@ class PolicyGradient(object):
 
             savefile = config_or_savefile
             save = utils.load(savefile)
+            self.savefile = savefile
             self.save   = save
             self.config = save['config']
 
@@ -90,6 +92,7 @@ class PolicyGradient(object):
             #-----------------------------------------------------------------------------
 
             config = config_or_savefile
+            self.savefile = None
             self.config = config
 
             # Time step
@@ -220,6 +223,30 @@ class PolicyGradient(object):
 
         # Performance
         self.Performance = self.config['Performance']
+
+    def checkpoint_dir(self):
+        if self.savefile is None:
+            raise ValueError("no savefile, so there is no checkpoint directory")
+        return os.path.join(os.path.dirname(self.savefile), 'checkpoints')
+
+    def list_checkpoints(self):
+        d = self.checkpoint_dir()
+        return sorted(int(f[5:-4]) for f in os.listdir(d)
+                      if f.startswith('iter_') and f.endswith('.pkl'))
+
+    def load_checkpoint(self, iter_):
+        """
+        Swap in a checkpoint's parameters in place. The network structure comes from the
+        savefile; only the parameters are overridden, and since they are shared variables
+        the already-compiled Theano functions need not be rebuilt.
+
+        """
+        ckpt = utils.load(os.path.join(self.checkpoint_dir(),
+                                       'iter_{:06d}.pkl'.format(int(iter_))))
+        self.policy_net.set_values(ckpt['policy_params'])
+        self.baseline_net.set_values(ckpt['baseline_params'])
+
+        return ckpt
 
     def make_noise(self, size, var=0):
         if var > 0:
@@ -747,6 +774,23 @@ class PolicyGradient(object):
                             'baseline_sgd':            self.baseline_sgd.get_values()
                             }
                         utils.save(savefile, save)
+
+                        # Full-parameter checkpoint snapshot (not overwritten each time),
+                        # so the entire training trajectory is preserved for later analysis
+                        # or hyperparameter tuning, not just the current/best params above.
+                        checkpoint_dir = os.path.join(os.path.dirname(savefile), 'checkpoints')
+                        utils.mkdir_p(checkpoint_dir)
+                        checkpoint_file = os.path.join(checkpoint_dir,
+                                                       'iter_{:06d}.pkl'.format(iter_))
+                        utils.save(checkpoint_file, {
+                            'iter':            iter_,
+                            'trials_tot':      trials_tot,
+                            'config':          self.config,
+                            'policy_params':   self.policy_net.get_values(),
+                            'baseline_params': self.baseline_net.get_values(),
+                            'mean_reward':     mean_reward,
+                            'perf':            perf_
+                            })
 
                         # Reward
                         items = OrderedDict()

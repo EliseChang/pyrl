@@ -38,6 +38,11 @@ mpl.rcParams['font.family']        = 'sans-serif'
 mpl.rcParams['ps.useafm']          = True
 mpl.rcParams['pdf.use14corefonts'] = True
 
+# The 14 core PDF fonts are WinAnsi-encoded and have no U+2212 MINUS SIGN, which is what
+# matplotlib emits for negative tick labels by default. Fall back to the ASCII hyphen-minus
+# so that negative numbers render in PDF output.
+mpl.rcParams['axes.unicode_minus'] = False
+
 # Setup LaTeX if available
 try:
     FNULL = open(os.devnull, 'w')
