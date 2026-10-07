@@ -4,6 +4,7 @@ Script for performing common tasks.
 
 """
 import argparse
+import ast
 import imp
 import os
 import shutil
@@ -22,6 +23,8 @@ p.add_argument('--dt', type=float, default=0)
 p.add_argument('--dt-save', type=float, default=0)
 p.add_argument('--seed', type=int, default=100)
 p.add_argument('--suffix', type=str, default='')
+p.add_argument('--config', action='append', default=[], metavar='KEY=VALUE',
+               help="override a model config key, e.g. --config rho=0.8")
 p.add_argument('--gpu', dest='gpu', action='store_true', default=False)
 a = p.parse_args()
 
@@ -38,11 +41,26 @@ seed    = a.seed
 suffix  = a.suffix
 gpu     = a.gpu
 
+# Config overrides. `literal_eval` (never `eval`) so that `rho=0.8`, `gates=False` and
+# `var_rec=0` get their proper Python types, while a bare word like `f_hidden=tanh`
+# fails to parse and is kept as a string.
+overrides = {}
+for kv in a.config:
+    if '=' not in kv:
+        print("--config expects KEY=VALUE, got {!r}".format(kv))
+        sys.exit(1)
+    k, v = kv.split('=', 1)
+    try:
+        overrides[k] = ast.literal_eval(v)
+    except (ValueError, SyntaxError):
+        overrides[k] = v
+
 print("MODELFILE: " + modelfile)
 print("ACTION:    " + action)
 print("ARGS:      " + str(args))
 print("SEED:      " + str(seed))
 print("SUFFIX:    " + suffix)
+print("CONFIG:    " + str(overrides))
 print("GPU:       " + str(gpu))
 
 # Set flags before importing Theano
@@ -107,6 +125,15 @@ if action == 'info':
 elif action == 'train':
     # Model specification
     model = Model(modelfile)
+
+    # Overrides apply to training only. Analysis reads its config back out of the
+    # savefile, so honouring them there would only let a run be analysed under
+    # assumptions it was not trained with.
+    for k, v in overrides.items():
+        if k not in model.config:
+            print("Unknown config key: {}".format(k))
+            sys.exit(1)
+        model.config[k] = v
 
     # Train
     model.train(savefile, seed, recover=('recover' in args))

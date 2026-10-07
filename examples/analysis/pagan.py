@@ -18,6 +18,8 @@ Single-unit panels (mante's `sort`) are deliberately not ported.
 from __future__ import absolute_import, division
 
 import os
+import re
+from   collections import OrderedDict
 
 import numpy as np
 
@@ -117,8 +119,14 @@ def get_preferred_targets(trials, perf, r):
     """
     return 2*(compute_dprime(trials, perf, r) > 0) - 1
 
-def is_active(r):
-    return np.std(r, axis=0) > 0.1
+# A unit counts as active if it varies appreciably relative to the most variable unit in
+# the population. mante uses an absolute cutoff (0.2), which is calibrated for unbounded
+# relu rates and would discard almost every unit of a tanh network, whose rates are
+# confined to [-1, 1]. Expressing the cutoff as a fraction of the population maximum gives
+# one code path that behaves the same way for either activation. 0.13 is chosen to
+# reproduce the absolute cutoff on the trained relu model, where max sd is 1.53: it selects
+# 86 of 100 units where the absolute cutoff selected 85, and drops none of them.
+ACTIVE_FRAC = 0.13
 
 def get_active_units(r, M):
     N   = r.shape[-1]
@@ -126,8 +134,9 @@ def get_active_units(r, M):
     r_  = r*M_
     n   = np.sum(M)
     var = (r_**2).sum(axis=0).sum(axis=0)/n - (r_.sum(axis=0).sum(axis=0)/n)**2
+    sd  = np.sqrt(var)
 
-    return np.where(np.sqrt(var) > 0.2)[0]
+    return np.where(sd > ACTIVE_FRAC*sd.max())[0]
 
 def sort_func(s, preferred_targets, target, trial):
     """
@@ -650,18 +659,16 @@ def statespace(trialsfile, plots=None, dt_reg=50, **kwargs):
 # Behaviour
 #/////////////////////////////////////////////////////////////////////////////////////////
 
-def psychometric(trialsfile, plots=None, **kwargs):
+def _psychometric_results(trials, perf):
     """
-    Psychometric functions against the realized evidence.
+    Core of psychometric(), operating on in-memory (trials, perf) rather than a trialsfile.
 
-    Trials are binned by `integral_bin`, and each bin is plotted at the mean rightward
-    evidence it actually contains, which gives `fittools.fit_psychometric` a meaningful
-    x-axis. Binning by the nominal `strength` would be wrong: a sizeable fraction of
-    strong-nominal trials realize an integral on the opposite side.
+    Trials are binned by `integral_bin`, and each bin's x is the mean rightward evidence it
+    actually contains, which gives `fittools.fit_psychometric` a meaningful x-axis. Binning
+    by the nominal `strength` would be wrong: a sizeable fraction of strong-nominal trials
+    realize an integral on the opposite side.
 
     """
-    trials, A, R, M, perf = utils.load(trialsfile)
-
     # results[k][level] = ([rightward evidence], [choices]), where k is
     # <cued context><evidence stream>.
     results = {cond: {} for cond in ['ll', 'lf', 'fl', 'ff']}
@@ -687,6 +694,16 @@ def psychometric(trialsfile, plots=None, **kwargs):
         x  = np.array([np.mean(by_level[level][0]) for level in levels])
         p1 = np.array([np.mean(by_level[level][1]) for level in levels])
         results[k] = (x, p1)
+
+    return results
+
+def psychometric(trialsfile, plots=None, **kwargs):
+    """
+    Psychometric functions against the realized evidence.
+
+    """
+    trials, A, R, M, perf = utils.load(trialsfile)
+    results = _psychometric_results(trials, perf)
 
     #-------------------------------------------------------------------------------------
     # Plot
@@ -731,6 +748,178 @@ def psychometric(trialsfile, plots=None, **kwargs):
         plots[s].yticks([0, 50, 100])
 
     return results
+
+#/////////////////////////////////////////////////////////////////////////////////////////
+# Per-checkpoint sweep (in-memory rollouts, no trials_behavior.pkl written)
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+LEVELS = [-3, -2, -1, 1, 2, 3]   # ascending: index 0 = strongly-left/low, index 5 = strongly-right/high
+
+def trial_evidence(trials):
+    """
+    Per-trial realized evidence bin indices, split by context. Trials/evidence realizations
+    are checkpoint- and (given fixed stim_seed) seed-invariant, so this is computed once per
+    seed (on the first checkpoint's trial build) and cached/reused for every subsequent
+    checkpoint, and stored once (not per-checkpoint) in the results file.
+
+    Returns {'loc': {...}, 'freq': {...}}, each a dict of arrays:
+      'trial_idx' -- index into `trials`/`perf` arrays
+      'x_loc', 'x_freq' -- realized (signed, rightward-convention) evidence value for that
+        trial's loc/freq stream
+      'loc_idx', 'freq_idx' -- 0-5 bin index (via LEVELS) for that trial's loc/freq evidence
+
+    Trials where either stream's integral_bin is None (zero evidence) are dropped, matching
+    _psychometric_results' existing behavior.
+
+    """
+    evidence = {'loc':  {'trial_idx': [], 'x_loc': [], 'x_freq': [], 'loc_idx': [], 'freq_idx': []},
+                'freq': {'trial_idx': [], 'x_loc': [], 'x_freq': [], 'loc_idx': [], 'freq_idx': []}}
+    for n, trial in enumerate(trials):
+        x_loc, x_freq = rightward(trial['integral_loc']), rightward(trial['integral_freq'])
+        loc_level, freq_level = integral_bin(x_loc), integral_bin(x_freq)
+        if loc_level is None or freq_level is None:
+            continue
+
+        ctx = trial['context']   # 'loc' or 'freq'
+        evidence[ctx]['trial_idx'].append(n)
+        evidence[ctx]['x_loc'].append(x_loc)
+        evidence[ctx]['x_freq'].append(x_freq)
+        evidence[ctx]['loc_idx'].append(LEVELS.index(loc_level))
+        evidence[ctx]['freq_idx'].append(LEVELS.index(freq_level))
+
+    for ctx in evidence:
+        evidence[ctx]['trial_idx'] = np.array(evidence[ctx]['trial_idx'], dtype=int)
+        evidence[ctx]['x_loc']     = np.array(evidence[ctx]['x_loc'], dtype=float)
+        evidence[ctx]['x_freq']    = np.array(evidence[ctx]['x_freq'], dtype=float)
+        evidence[ctx]['loc_idx']   = np.array(evidence[ctx]['loc_idx'], dtype=int)
+        evidence[ctx]['freq_idx']  = np.array(evidence[ctx]['freq_idx'], dtype=int)
+    return evidence
+
+def context_choice_matrix(perf, evidence_ctx):
+    """
+    Build the 6x6 joint (p_right, n) matrix for one context from cached evidence indices
+    (from trial_evidence) plus the current checkpoint's perf.choices/perf.decisions. Rows =
+    loc_idx (0=strongly-left .. 5=strongly-right), columns = freq_idx (0=strongly-low ..
+    5=strongly-high). Only decided trials count (matches _psychometric_results); cells with
+    n==0 have p_right = nan.
+
+    """
+    n         = np.zeros((6, 6), dtype=int)
+    right_sum = np.zeros((6, 6))
+    for trial_n, i, j in zip(evidence_ctx['trial_idx'], evidence_ctx['loc_idx'],
+                              evidence_ctx['freq_idx']):
+        if not perf.decisions[trial_n]:
+            continue
+        n[i, j] += 1
+        if perf.choices[trial_n] == 'R':
+            right_sum[i, j] += 1
+
+    p_right = np.full((6, 6), np.nan)
+    mask = n > 0
+    p_right[mask] = right_sum[mask]/n[mask]
+    return {'p_right': p_right, 'n': n}
+
+def checkpoint_psychometric_metrics(trials, perf):
+    """Returns (fits, derived) for one in-memory rollout, via marginal per-stream binning."""
+    points = _psychometric_results(trials, perf)
+    fits = {}
+    for k, (x, p1) in points.items():
+        if len(x) < 3:
+            continue
+        try:
+            popt, _ = fittools.fit_psychometric(x, p1)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        fits[k] = popt
+
+    nan = {'slope_rel': np.nan, 'slope_irr': np.nan, 'selectivity': np.nan,
+           'bias_rel': np.nan}
+    if not all(k in fits for k in ['ll', 'lf', 'fl', 'ff']):
+        return fits, nan
+
+    slope = lambda k: 1/abs(fits[k]['sigma'])
+    rel = np.mean([slope('ll'), slope('ff')])
+    irr = np.mean([slope('lf'), slope('fl')])
+    derived = {'slope_rel': rel, 'slope_irr': irr,
+               'selectivity': (rel - irr)/(rel + irr) if rel + irr > 0 else np.nan,
+               'bias_rel': np.mean([fits['ll']['mu'], fits['ff']['mu']])}
+    return fits, derived
+
+def checkpoint_record(iter_, trials, perf, R, M, evidence, history_record):
+    """Assemble one checkpoint's lightweight metrics record."""
+    fits, derived = checkpoint_psychometric_metrics(trials, perf)
+    loc_context  = context_choice_matrix(perf, evidence['loc'])
+    freq_context = context_choice_matrix(perf, evidence['freq'])
+
+    n = len(trials)
+    p_decision = perf.n_decision/perf.n_trials if perf.n_trials > 0 else np.nan
+    p_correct  = perf.n_correct/perf.n_decision if perf.n_decision > 0 else np.nan
+    mean_reward_rollout = float(np.sum(R*M)/n)
+
+    if history_record is not None:
+        h = history_record['perf']
+        history = {'n_correct': h.n_correct, 'n_decision': h.n_decision,
+                   'n_trials': h.n_trials,   # validation-batch size; NOT
+                                              # history_record['n_trials'] (= trials_tot)
+                   'mean_reward': history_record['mean_reward']}
+    else:
+        print("[ checkpoint_record ] WARNING: no training_history record for iter {}"
+              .format(iter_))
+        history = {'n_correct': np.nan, 'n_decision': np.nan, 'n_trials': np.nan,
+                   'mean_reward': np.nan}
+
+    return {'iter': iter_, 'history': history,
+            'rollout': {'p_correct': p_correct, 'p_decision': p_decision,
+                       'mean_reward': mean_reward_rollout},
+            'loc_context': loc_context, 'freq_context': freq_context,
+            'psychometric_fits': {k: dict(v) for k, v in fits.items()},
+            'derived': derived}
+
+def checkpointsweep_metrics(pg, spec, trials_per_condition, checkpoints, history_by_iter,
+                            resultsfile=None):
+    """
+    Roll out build_trials(...) in memory at every checkpoint, restoring pg.rng/
+    pg.rng_action to the same state before each (so trial/action draws are identical
+    across checkpoints). Per-trial evidence bin indices (trial_evidence) are
+    checkpoint-invariant, so computed once (from the first checkpoint processed) and cached
+    under saved['evidence']; only saved['checkpoints'] grows thereafter. Writes to
+    resultsfile after every checkpoint (small file, cheap to rewrite in full) so an
+    interrupted run is resumable: skips iters already present.
+
+    """
+    saved = {'evidence': None, 'checkpoints': []}
+    if resultsfile is not None and os.path.isfile(resultsfile):
+        saved = utils.load(resultsfile)
+        print("[ checkpointsweep ] {} checkpoints already done in {}"
+              .format(len(saved['checkpoints']), resultsfile))
+    done_iters = set(r['iter'] for r in saved['checkpoints'])
+
+    rng_state        = pg.rng.get_state()
+    rng_action_state = pg.rng_action.get_state()
+    for iter_ in [it for it in checkpoints if it not in done_iters]:
+        pg.rng.set_state(rng_state)
+        pg.rng_action.set_state(rng_action_state)
+        pg.load_checkpoint(iter_)
+
+        trials = build_trials(pg, spec, trials_per_condition)
+        (U, Q, Q_b, Z, Z_b, A, R, M, init, init_b, x0, x0_b,
+         perf) = pg.run_trials(trials, progress_bar=False)
+
+        if saved['evidence'] is None:
+            saved['evidence'] = trial_evidence(trials)
+
+        record = checkpoint_record(iter_, trials, perf, R, M, saved['evidence'],
+                                    history_by_iter.get(iter_))
+        saved['checkpoints'].append(record)
+        saved['checkpoints'].sort(key=lambda r: r['iter'])
+        if resultsfile is not None:
+            utils.save(resultsfile, saved)
+
+        print("[ checkpointsweep ] iter {:6d}  p_correct={:.3f}  p_decision={:.3f}  "
+              "selectivity={:.3f}".format(iter_, record['rollout']['p_correct'],
+                                          record['rollout']['p_decision'],
+                                          record['derived']['selectivity']))
+    return saved
 
 def performance(savefile, plot, **kwargs):
     """
@@ -971,6 +1160,404 @@ def checkpoint_targets(config, args):
 
     return targets
 
+#/////////////////////////////////////////////////////////////////////////////////////////
+# Architecture sweep
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+# Run directories are named pagan_<f_hidden>_rho<NN>_<noise|nonoise>_s<seed> by
+# examples/sweep_pagan.py. Parsing the name rather than importing the driver keeps the
+# analysis usable on any subset of runs that happens to be on disk.
+SWEEP_RE = re.compile(r'^pagan_(?P<f_hidden>[a-z]+)_rho(?P<rho>\d+)'
+                      r'_(?P<noise>noise|nonoise)_s(?P<seed>\d+)$')
+
+def sweep_runs(datapath):
+    """
+    Discover completed sweep runs under `datapath`, newest-style names only.
+
+    Returns a list of (f_hidden, rho, noise, seed, savefile), sorted.
+
+    """
+    runs = []
+    for name in sorted(os.listdir(datapath)):
+        m = SWEEP_RE.match(name)
+        if m is None:
+            continue
+
+        savefile = os.path.join(datapath, name, name + '.pkl')
+        if not os.path.isfile(savefile):
+            continue
+
+        runs.append((m.group('f_hidden'), int(m.group('rho'))/10,
+                     m.group('noise'), int(m.group('seed')), savefile))
+
+    return runs
+
+def sweep_curve(savefile):
+    """
+    (iters, p_correct, converged, final_p_decision) for one run.
+
+    """
+    save    = utils.load(savefile)
+    history = save['training_history']
+
+    iters     = []
+    p_correct = []
+    p_dec     = []
+    for record in history:
+        perf = record['perf']
+        if perf.n_decision > 0:
+            iters.append(record['iter'])
+            p_correct.append(perf.n_correct/perf.n_decision)
+            p_dec.append(perf.n_decision/perf.n_trials)
+
+    # `terminate` in the task module is what stopped training early; a run that used up
+    # its whole budget is a failure to reach criterion.
+    converged = save['config']['max_iter'] not in iters
+
+    return (np.asarray(iters), np.asarray(p_correct), converged,
+            p_dec[-1] if p_dec else 0.)
+
+def sweep(datapath, figspath):
+    """
+    Compare learning across the architecture grid.
+
+    """
+    runs = sweep_runs(datapath)
+    if not runs:
+        raise ValueError('no sweep runs found in {}'.format(datapath))
+
+    rhos   = sorted(set(r[1] for r in runs))
+    colors = {rho: c for rho, c in zip(rhos, ['0.6', 'k', '#d62728', '#1f77b4'])}
+
+    activations = sorted(set(r[0] for r in runs))
+    noises      = [n for n in ['noise', 'nonoise'] if any(r[2] == n for r in runs)]
+
+    #=====================================================================================
+    # Learning curves, one panel per (activation, noise condition)
+    #=====================================================================================
+
+    w, h, dx, dy = 0.36, 0.33, 0.12, 0.14
+    x0, y0       = 0.1, 0.58
+
+    fig = Figure(w=6.5, h=5)
+    for i, f_hidden in enumerate(activations):
+        for j, noise in enumerate(noises):
+            name = '{}-{}'.format(f_hidden, noise)
+            fig.add(name, [x0 + j*(w + dx), y0 - i*(h + dy), w, h])
+
+    summary = []
+    for f_hidden, rho, noise, seed, savefile in runs:
+        name = '{}-{}'.format(f_hidden, noise)
+        if name not in fig.plots:
+            continue
+
+        iters, p_correct, converged, p_dec = sweep_curve(savefile)
+        summary.append((f_hidden, rho, noise, seed, iters, p_correct, converged, p_dec))
+
+        if len(iters) == 0:
+            continue
+
+        fig[name].plot(iters, 100*p_correct, color=colors[rho], lw=1.25)
+        fig[name].plot(iters, 100*p_correct, 'o', mfc=colors[rho], mew=0, ms=3)
+
+    for i, f_hidden in enumerate(activations):
+        for j, noise in enumerate(noises):
+            plot = fig['{}-{}'.format(f_hidden, noise)]
+            plot.hline(85, color='0.8', lw=0.75, zorder=1)
+            plot.ylim(0, 100)
+            plot.yticks([0, 50, 100])
+            plot.text_upper_left('{}, {}'.format(
+                f_hidden, 'noise' if noise == 'noise' else 'no noise'))
+            if i == len(activations) - 1:
+                plot.xlabel('Policy gradient updates')
+            if j == 0:
+                plot.ylabel('Percent correct')
+
+    # One legend is enough for the whole grid.
+    first = fig['{}-{}'.format(activations[0], noises[0])]
+    for k, rho in enumerate(rhos):
+        first.text_upper_right(r'$\rho$ = {}'.format(rho), dy=-0.09*k,
+                               color=colors[rho])
+
+    fig.save(path=figspath, name='learning')
+    fig.close()
+
+    #=====================================================================================
+    # Text summary, averaged over seeds
+    #=====================================================================================
+
+    cells = OrderedDict()
+    for f_hidden, rho, noise, seed, iters, p_correct, converged, p_dec in summary:
+        cells.setdefault((f_hidden, rho, noise), []).append(
+            (seed, iters, p_correct, converged, p_dec))
+
+    lines = ['{:6s} {:5s} {:8s} {:>5s} {:>9s} {:>12s} {:>12s}'.format(
+        'act', 'rho', 'noise', 'seeds', 'converged', 'iter@crit', 'P(correct)')]
+    for (f_hidden, rho, noise), entries in cells.items():
+        n_conv    = sum(e[3] for e in entries)
+        last_corr = [e[2][-1] for e in entries if len(e[2])]
+        crit      = [e[1][-1] for e in entries if e[3]]
+
+        lines.append('{:6s} {:<5.1f} {:8s} {:>5d} {:>9s} {:>12s} {:>12s}'.format(
+            f_hidden, rho, noise, len(entries),
+            '{}/{}'.format(n_conv, len(entries)),
+            '{:.0f}'.format(np.mean(crit)) if crit else '-',
+            '{:.3f}+-{:.3f}'.format(np.mean(last_corr), np.std(last_corr))
+            if last_corr else '-'))
+
+    text = '\n'.join(lines) + '\n'
+    print(text)
+
+    utils.mkdir_p(figspath)
+    with open(os.path.join(figspath, 'summary.txt'), 'w') as f:
+        f.write(text)
+
+#/////////////////////////////////////////////////////////////////////////////////////////
+# Seed variance decomposition
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+# Run directories named by examples/sweep_seeds.py: weight seed x training seed.
+SEEDVAR_RE = re.compile(r'^pagan_seedvar_w(?P<w>\d+)_t(?P<t>\d+)$')
+
+# Metrics reported for every run. The first four also get figure panels.
+SEEDVAR_METRICS = ['p_correct', 'p_decision', 'iter_crit', 'mean_reward',
+                   'slope_rel', 'slope_irr', 'selectivity', 'bias_rel']
+SEEDVAR_PANELS  = ['p_correct', 'iter_crit', 'slope_rel', 'selectivity']
+
+def seedvar_runs(datapath, trialsroot):
+    """
+    Discover seed-sweep runs. Returns a list of (w, t, savefile, trialsfile), sorted.
+
+    """
+    runs = []
+    for name in sorted(os.listdir(datapath)):
+        m = SEEDVAR_RE.match(name)
+        if m is None:
+            continue
+
+        savefile = os.path.join(datapath, name, name + '.pkl')
+        if not os.path.isfile(savefile):
+            continue
+
+        runs.append((int(m.group('w')), int(m.group('t')), savefile,
+                     runtools.behaviorfile(os.path.join(trialsroot, name))))
+
+    return sorted(runs)
+
+def seedvar_savefile_metrics(savefile):
+    """
+    Scalar outcomes read straight out of one run's savefile.
+
+    """
+    save    = utils.load(savefile)
+    history = save['training_history']
+
+    records = [r for r in history if r['perf'].n_decision > 0]
+    if not records:
+        return {'p_correct': np.nan, 'p_decision': np.nan, 'iter_crit': np.nan,
+                'mean_reward': np.nan, 'converged': False}
+
+    # `terminate` in the task module is what stops training early, so a run that used up
+    # its whole budget never reached criterion. Its time-to-criterion is censored at the
+    # cap rather than dropped (non-convergence is part of the variability being measured).
+    max_iter  = save['config']['max_iter']
+    converged = max_iter not in [r['iter'] for r in history]
+
+    best = max(records, key=lambda r: r['perf'].n_correct/r['perf'].n_decision)
+
+    return {'p_correct':   best['perf'].n_correct/best['perf'].n_decision,
+            'p_decision':  best['perf'].n_decision/best['perf'].n_trials,
+            'iter_crit':   best['iter'] if converged else max_iter,
+            'mean_reward': history[-1]['mean_reward'],
+            'converged':   converged}
+
+def seedvar_psychometric_metrics(trialsfile):
+    """
+    Psychometric shape parameters for one run.
+
+    `psychometric` with `plots=None` returns {'<context><stream>': (evidence, P(right))};
+    'll'/'ff' are the cued (relevant) stream, 'lf'/'fl' the ignored one. Sensitivity is
+    the slope 1/sigma of the fitted cumulative Gaussian, so a network that gates context
+    properly has a large relevant slope and a near-zero irrelevant one.
+
+    """
+    nan = {'slope_rel': np.nan, 'slope_irr': np.nan, 'selectivity': np.nan,
+           'bias_rel': np.nan}
+    if not os.path.isfile(trialsfile):
+        return nan
+
+    results = psychometric(trialsfile, plots=None)
+
+    fits = {}
+    for k, (x, p1) in results.items():
+        if len(x) < 3:
+            continue
+        try:
+            popt, _ = fittools.fit_psychometric(x, p1)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        fits[k] = popt
+
+    if not all(k in fits for k in ['ll', 'lf', 'fl', 'ff']):
+        return nan
+
+    slope = lambda k: 1/abs(fits[k]['sigma'])
+    rel   = np.mean([slope('ll'), slope('ff')])
+    irr   = np.mean([slope('lf'), slope('fl')])
+
+    return {'slope_rel':   rel,
+            'slope_irr':   irr,
+            'selectivity': (rel - irr)/(rel + irr) if rel + irr > 0 else np.nan,
+            'bias_rel':    np.mean([fits['ll']['mu'], fits['ff']['mu']])}
+
+def variance_components(M):
+    """
+    Balanced two-factor random-effects decomposition of `M[i,j]`, rows = factor A
+    (weight seed), columns = factor B (training seed), with one observation per cell.
+
+    With n = 1 the interaction and the residual are confounded, so MS_AB estimates
+    sigma^2_(interaction+error) and is also the error term for both main effects.
+
+    Returns an OrderedDict of component -> (variance, F, p); F/p are None for the
+    confounded term.
+
+    """
+    from scipy.stats import f as f_dist
+
+    a, b = M.shape
+    grand = M.mean()
+    row   = M.mean(axis=1)
+    col   = M.mean(axis=0)
+
+    ms_a  = b*((row - grand)**2).sum()/(a - 1)
+    ms_b  = a*((col - grand)**2).sum()/(b - 1)
+    resid = M - row[:,None] - col[None,:] + grand
+    ms_ab = (resid**2).sum()/((a - 1)*(b - 1))
+
+    out = OrderedDict()
+    if ms_ab > 0:
+        out['weight']   = (max(0., (ms_a - ms_ab)/b), ms_a/ms_ab,
+                           f_dist.sf(ms_a/ms_ab, a - 1, (a - 1)*(b - 1)))
+        out['training'] = (max(0., (ms_b - ms_ab)/a), ms_b/ms_ab,
+                           f_dist.sf(ms_b/ms_ab, b - 1, (a - 1)*(b - 1)))
+    else:
+        out['weight']   = (max(0., ms_a/b), None, None)
+        out['training'] = (max(0., ms_b/a), None, None)
+    out['interaction+residual'] = (ms_ab, None, None)
+
+    return out
+
+def seedvar(datapath, trialsroot, figspath):
+    """
+    How much of the run-to-run variability is the network (weight seed) and how much is
+    the training experience (stimulus + action sampling)?
+
+    """
+    runs = seedvar_runs(datapath, trialsroot)
+    if not runs:
+        raise ValueError('no seedvar runs found in {}'.format(datapath))
+
+    ws = sorted(set(r[0] for r in runs))
+    ts = sorted(set(r[1] for r in runs))
+
+    metrics = {}
+    n_conv  = 0
+    for w, t, savefile, trialsfile in runs:
+        m = seedvar_savefile_metrics(savefile)
+        n_conv += m.pop('converged')
+        m.update(seedvar_psychometric_metrics(trialsfile))
+        metrics[(w, t)] = m
+
+    def grid_of(metric):
+        return np.array([[metrics[(w, t)][metric] if (w, t) in metrics else np.nan
+                          for t in ts] for w in ws])
+
+    #=====================================================================================
+    # Text report
+    #=====================================================================================
+
+    lines = ['{} runs, {} weight seeds x {} training seeds, converged {}/{}'
+             .format(len(runs), len(ws), len(ts), n_conv, len(runs)), '']
+
+    for metric in SEEDVAR_METRICS:
+        M = grid_of(metric)
+
+        lines.append(metric)
+        lines.append('  {:>4s} '.format('w\\t') +
+                     ' '.join('{:>10d}'.format(t) for t in ts))
+        for i, w in enumerate(ws):
+            lines.append('  {:>4d} '.format(w) +
+                         ' '.join('{:>10.4g}'.format(v) for v in M[i]))
+
+        if np.isnan(M).any() or M.shape[0] < 2 or M.shape[1] < 2:
+            lines.append('  (incomplete grid, no decomposition)')
+            lines.append('')
+            continue
+
+        comps = variance_components(M)
+        total = sum(v for v, _, _ in comps.values())
+        lines.append('  total variance {:.4g}'.format(total))
+        for name, (var, F, p) in comps.items():
+            frac = 100*var/total if total > 0 else 0.
+            fp   = '' if F is None else '   F = {:.2f}, p = {:.3g}'.format(F, p)
+            lines.append('  {:<22s} {:>10.4g}  {:>5.1f}%{}'.format(name, var, frac, fp))
+        lines.append('')
+
+    text = '\n'.join(lines) + '\n'
+    print(text)
+
+    utils.mkdir_p(figspath)
+    with open(os.path.join(figspath, 'seedvar.txt'), 'w') as f:
+        f.write(text)
+
+    #=====================================================================================
+    # Figure: per-metric spread across the grid, and its decomposition
+    #=====================================================================================
+
+    colors = ['k', '#d62728', '#1f77b4', '#2ca02c', '#9467bd']
+
+    wpanel, hpanel, dx, dy = 0.42, 0.16, 0.16, 0.07
+    x0, y0 = 0.1, 0.78
+
+    fig = Figure(w=6.5, h=8)
+    for i, metric in enumerate(SEEDVAR_PANELS):
+        fig.add(metric,          [x0, y0 - i*(hpanel + dy), wpanel, hpanel])
+        fig.add(metric + '-var', [x0 + wpanel + dx, y0 - i*(hpanel + dy),
+                                  0.22, hpanel])
+
+    for i, metric in enumerate(SEEDVAR_PANELS):
+        M    = grid_of(metric)
+        plot = fig[metric]
+        for j, t in enumerate(ts):
+            plot.plot(ws, M[:,j], 'o', ms=3.5, mew=0,
+                      mfc=colors[j % len(colors)], label='t = {}'.format(t))
+        plot.plot(ws, np.nanmean(M, axis=1), color='0.6', lw=1, zorder=1)
+        plot.ylabel(metric)
+        if i == len(SEEDVAR_PANELS) - 1:
+            plot.xlabel('Weight seed')
+
+        bars = fig[metric + '-var']
+        if np.isnan(M).any():
+            continue
+
+        comps = variance_components(M)
+        total = sum(v for v, _, _ in comps.values())
+        if total <= 0:
+            continue
+
+        fracs = [100*v/total for v, _, _ in comps.values()]
+        bars.bar(range(len(fracs)), fracs, color=['k', '#d62728', '0.7'], width=0.6)
+        bars.set_xticks(range(len(fracs)))
+        bars.set_xticklabels(['weight', 'train', 'int+res'], fontsize=6)
+        bars.ylim(0, 100)
+        bars.ylabel('% of variance')
+
+    fig[SEEDVAR_PANELS[0]].text_upper_left('{} weight x {} training seeds'
+                                           .format(len(ws), len(ts)))
+
+    fig.save(path=figspath, name='seedvar')
+    fig.close()
+
 def do(action, args, config):
     """
     Manage tasks.
@@ -998,9 +1585,11 @@ def do(action, args, config):
 
         # Resetting the RNG per checkpoint draws the same trial condition every time, so
         # the figures differ only in what the network did with it.
-        rng_state = pg.rng.get_state()
+        rng_state        = pg.rng.get_state()
+        rng_action_state = pg.rng_action.get_state()
         for iter_, _, figspath in checkpoint_targets(config, args):
             pg.rng.set_state(rng_state)
+            pg.rng_action.set_state(rng_action_state)
             if iter_ is not None:
                 pg.load_checkpoint(iter_)
             plot_trial(pg, model.spec, pg.rng, figspath, 'trial')
@@ -1036,9 +1625,11 @@ def do(action, args, config):
         # regenerates identical stimuli, so any difference between checkpoints is due to
         # the parameters alone. The trials must be rebuilt each time because runtools.run
         # subsamples trial['time'] in place when dt_save is set.
-        rng_state = pg.rng.get_state()
+        rng_state        = pg.rng.get_state()
+        rng_action_state = pg.rng_action.get_state()
         for iter_ in iters:
             pg.rng.set_state(rng_state)
+            pg.rng_action.set_state(rng_action_state)
 
             if iter_ is None:
                 path = config['trialspath']
@@ -1050,6 +1641,36 @@ def do(action, args, config):
 
             trials = build_trials(pg, model.spec, trials_per_condition)
             runtools.run(action, trials, pg, path, dt_save=config['dt-save'])
+
+    #=====================================================================================
+
+    elif action == 'checkpointsweep':
+        kwargs     = dict(kv.split('=', 1) for kv in args if '=' in kv)
+        positional = [a for a in args if '=' not in a]
+        try:
+            trials_per_condition = int(positional[0])
+        except (IndexError, ValueError):
+            trials_per_condition = 50
+
+        model = config['model']
+        pg    = model.get_pg(config['savefile'], config['seed'], config['dt'])
+
+        iters_arg = kwargs.get('iters', 'all')
+        checkpoints = pg.list_checkpoints() if iters_arg == 'all' \
+                      else [int(i) for i in iters_arg.split(',')]
+
+        print("checkpointsweep: {} checkpoints, {} trials/condition ({} trials/checkpoint)"
+              .format(len(checkpoints), trials_per_condition,
+                      model.spec.n_conditions*trials_per_condition))
+
+        save            = utils.load(config['savefile'])
+        history_by_iter = {r['iter']: r for r in save['training_history']}
+
+        resultsfile = os.path.join(config['datapath'], 'checkpoint_metrics.pkl')
+        saved = checkpointsweep_metrics(pg, model.spec, trials_per_condition, checkpoints,
+                                        history_by_iter, resultsfile=resultsfile)
+        print("checkpointsweep: wrote {} checkpoint records to {}"
+              .format(len(saved['checkpoints']), resultsfile))
 
     #=====================================================================================
 
@@ -1091,6 +1712,27 @@ def do(action, args, config):
                 statespace(runtools.activityfile(trialspath), (figspath, 'statespace'))
             except Exception as e:
                 print("[ pagan.statespace ] Skipping iter {}: {}".format(iter_, e))
+
+    #=====================================================================================
+
+    elif action == 'sweep':
+        # Sibling run directories of this run's own data directory.
+        datapath = os.path.dirname(os.path.dirname(config['savefile']))
+        figspath = os.path.join(os.path.dirname(config['figspath']), 'pagan_sweep')
+        utils.mkdir_p(figspath)
+
+        sweep(datapath, figspath)
+
+    #=====================================================================================
+
+    elif action == 'seedvar':
+        # Sibling run directories of this run's own data and trials directories.
+        datapath   = os.path.dirname(os.path.dirname(config['savefile']))
+        trialsroot = os.path.dirname(config['trialspath'])
+        figspath   = os.path.join(os.path.dirname(config['figspath']), 'pagan_seedvar')
+        utils.mkdir_p(figspath)
+
+        seedvar(datapath, trialsroot, figspath)
 
     #=====================================================================================
 

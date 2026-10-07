@@ -10,7 +10,7 @@ import numpy as np
 import theano
 from   theano import tensor
 
-from .         import nptools, tasktools, theanotools, utils
+from .         import configs, nptools, tasktools, theanotools, utils
 from .debug    import DEBUG
 from .networks import Networks
 from .sgd      import Adam
@@ -112,11 +112,16 @@ class PolicyGradient(object):
                 'Nout':     config['Nout'],
                 'p0':       config['p0'],
                 'rho':      config['rho'],
+                'f_hidden': config['f_hidden'],
+                'gates':    config['gates'],
+                'Wrec_init': config['Wrec_init'],
+                'Wout':     config['Wout'],
                 'f_out':    'softmax',
                 'Win':      config['Win']*np.sqrt(K)/config['Nin'],
                 'Win_mask': config['Win_mask'],
                 'fix':      config['fix'],
                 'L2_r':     config['L2_r'],
+                'L2_x':     config['L2_x'],
                 'L1_Wrec':  config['L1_Wrec'],
                 'L2_Wrec':  config['L2_Wrec'],
                 'alpha':    alpha
@@ -150,6 +155,10 @@ class PolicyGradient(object):
                 'Nout':     1,
                 'p0':       config['baseline_p0'],
                 'rho':      config['baseline_rho'],
+                'f_hidden': config['f_hidden'],
+                'gates':    config['gates'],
+                'Wrec_init': config['Wrec_init'],
+                'Wout':     config['baseline_Wout'],
                 'f_out':    'linear',
                 'Win':      config['baseline_Win']*np.sqrt(K)/baseline_Nin,
                 'Win_mask': config['baseline_Win_mask'],
@@ -212,8 +221,18 @@ class PolicyGradient(object):
             self.R_TERMINAL = self.config['R_ABORTED']
         self.R_ABORTED = self.config['R_ABORTED']
 
-        # Random number generator
-        self.rng = nptools.get_rng(seed, __name__)
+        # Random number generators, one per independent stream. `self.rng` keeps its name
+        # and is the stimulus/trial stream, which is what every analysis module reads.
+        # Savefiles written before the streams were split carry neither derived seed, so
+        # fall back to deriving them from `seed`.
+        derived = configs.derive_seeds(seed, self.config)
+        self.rng        = nptools.get_rng(seed, __name__ + ' (trials)')
+        self.rng_action = nptools.get_rng(self.config.get('action_rng_seed',
+                                                          derived['action_rng_seed']),
+                                          __name__ + ' (actions)')
+        self.rng_noise  = nptools.get_rng(self.config.get('noise_rng_seed',
+                                                          derived['noise_rng_seed']),
+                                          __name__ + ' (noise)')
 
         # Compile functions
         self.policy_step_0   = self.policy_net.func_step_0()
@@ -250,7 +269,8 @@ class PolicyGradient(object):
 
     def make_noise(self, size, var=0):
         if var > 0:
-            return theanotools.asarray(self.rng.normal(scale=np.sqrt(var), size=size))
+            return theanotools.asarray(self.rng_noise.normal(scale=np.sqrt(var),
+                                                             size=size))
         return theanotools.zeros(size)
 
     def run_trials(self, trials, init=None, init_b=None,
@@ -316,6 +336,12 @@ class PolicyGradient(object):
                 progress_half = -1
             utils.println("[ PolicyGradient.run_trials ] ")
 
+        # Outcome of the previous trial in this batch, as (choice, terminal reward), for
+        # tasks that feed trial history back as input. None for the first trial of every
+        # batch and after any trial that ended without a decision; tasks that don't read
+        # `trial['prev_outcome']` are unaffected.
+        prev_outcome = None
+
         for n in xrange(n_trials):
             if progress_bar and n % progress_inc == 0:
                 if n == 0:
@@ -335,6 +361,7 @@ class PolicyGradient(object):
             else:
                 trial = self.task.get_condition(self.rng, self.dt)
                 trials.append(trial)
+            trial['prev_outcome'] = prev_outcome
 
             #-----------------------------------------------------------------------------
             # Time t = 0
@@ -361,15 +388,18 @@ class PolicyGradient(object):
                 r_value[t,n]  = self.baseline_net.firing_rate(x_t_b[0])
 
             # Select action
-            a_t = theanotools.choice(self.rng, self.Nout, p=np.reshape(z_t, (self.Nout,)))
+            a_t = theanotools.choice(self.rng_action, self.Nout,
+                                     p=np.reshape(z_t, (self.Nout,)))
             A[t,n,a_t] = 1
 
             #a_t = self.rng.normal(np.reshape(z_t, (self.Nout,)), self.sigma)
             #A[t,n,0] = a_t
 
-            # Trial step
-            U[t,n], R[t,n], status = self.task.get_step(self.rng, self.dt,
-                                                        trial, t+1, a_t)
+            # Trial step. `reward_t` keeps the undiscounted reward, since R[t,n] is scaled
+            # by the discount factor in place below.
+            U[t,n], reward_t, status = self.task.get_step(self.rng, self.dt,
+                                                          trial, t+1, a_t)
+            R[t,n] = reward_t
             u_t    = U[t,n]
             M[t,n] = 1
 
@@ -411,7 +441,7 @@ class PolicyGradient(object):
                     #print(np.exp(V))
 
                 # Select action
-                a_t = theanotools.choice(self.rng, self.Nout,
+                a_t = theanotools.choice(self.rng_action, self.Nout,
                                          p=np.reshape(z_t, (self.Nout,)))
                 A[t,n,a_t] = 1
 
@@ -420,12 +450,14 @@ class PolicyGradient(object):
 
                 # Trial step
                 if self.abort_on_last_t and t == self.Tmax-1:
-                    U[t,n] = 0
-                    R[t,n] = self.R_TERMINAL
-                    status = {'continue': False, 'reward': R[t,n]}
+                    U[t,n]   = 0
+                    reward_t = self.R_TERMINAL
+                    R[t,n]   = reward_t
+                    status   = {'continue': False, 'reward': reward_t}
                 else:
-                    U[t,n], R[t,n], status = self.task.get_step(self.rng, self.dt,
-                                                                trial, t+1, a_t)
+                    U[t,n], reward_t, status = self.task.get_step(self.rng, self.dt,
+                                                                  trial, t+1, a_t)
+                    R[t,n] = reward_t
                 R[t,n] *= self.discount_factor(t)
 
                 u_t    = U[t,n]
@@ -437,8 +469,18 @@ class PolicyGradient(object):
 
             #-----------------------------------------------------------------------------
 
-            # Update performance
+            # Update performance. `action`/`reward` are the trial's final action index and
+            # its undiscounted terminating reward, recorded for every trial.
+            status['action'] = a_t
+            status['reward'] = reward_t
             perf.update(trial, status)
+
+            # Outcome handed to the next trial in this batch. A trial that ended without a
+            # decision (no choice) passes None, so its successor sees no history.
+            if status.get('choice') is not None:
+                prev_outcome = (status['choice'], reward_t)
+            else:
+                prev_outcome = None
 
             # Save next state if necessary
             if self.mode == 'continuous':
@@ -476,13 +518,23 @@ class PolicyGradient(object):
         b = tensor.matrix('b')
         M = tensor.matrix('M')
 
-        logpi_0 = tensor.sum(log_z_0*A[0], axis=-1)*M[0]
-        logpi_t = tensor.sum(log_z*A[1:],  axis=-1)*M[1:]
+        # Mdec masks the REINFORCE score function to the decision epoch: for tasks (like
+        # pagan) where actions before some `trial['dec_t0']` are null and cannot affect the
+        # trial, giving them credit for the eventual return would just add variance to the
+        # gradient. Mdec == M for tasks with no such epoch (e.g. mante), so this is a no-op
+        # there. Only logpi_0/logpi_t are masked with it - entropy and the regularizers
+        # below still use the full-trial M.
+        Mdec = tensor.matrix('Mdec')
 
-        # Entropy
-        #entropy_0 = tensor.sum(tensor.exp(log_z_0)*log_z_0, axis=-1)*M[0]
-        #entropy_t = tensor.sum(tensor.exp(log_z)*log_z, axis=-1)*M[1:]
-        #entropy   = (tensor.sum(entropy_0) + tensor.sum(entropy_t))/tensor.sum(M)
+        logpi_0 = tensor.sum(log_z_0*A[0], axis=-1)*Mdec[0]
+        logpi_t = tensor.sum(log_z*A[1:],  axis=-1)*Mdec[1:]
+
+        # Entropy. entropy_0/entropy_t hold sum(p*log p) (negative entropy), so adding
+        # beta_entropy*entropy to the (minimized) objective below is equivalent to
+        # subtracting beta_entropy*true_entropy, i.e. rewarding higher entropy.
+        entropy_0 = tensor.sum(tensor.exp(log_z_0)*log_z_0, axis=-1)*M[0]
+        entropy_t = tensor.sum(tensor.exp(log_z)*log_z, axis=-1)*M[1:]
+        entropy   = (tensor.sum(entropy_0) + tensor.sum(entropy_t))/tensor.sum(M)
 
         #def f(x):
         #    return -x**2/2/self.sigma**2
@@ -512,7 +564,7 @@ class PolicyGradient(object):
         J -= Jb0 + Jb
 
         # Objective function
-        obj = -J + self.policy_net.get_regs(x0_, r, M)# + 0.0005*entropy
+        obj = -J + self.policy_net.get_regs(x0_, r, M) + self.config['beta_entropy']*entropy
 
         # SGD
         self.policy_sgd = Adam(self.policy_net.trainables, accumulators=accumulators)
@@ -528,7 +580,7 @@ class PolicyGradient(object):
             args = [x0_]
         else:
             args = []
-        args += [U, Q, A, R, b, M, lr]
+        args += [U, Q, A, R, b, M, Mdec, lr]
 
         return theano.function(args, norm, updates=updates)
 
@@ -616,12 +668,30 @@ class PolicyGradient(object):
         items['N (baseline)']             = self.config['baseline_N']
         items['Conn. prob. (policy)']     = self.config['p0']
         items['Conn. prob. (baseline)']   = self.config['baseline_p0']
+        items['f_hidden']                 = self.config['f_hidden']
+        items['Gates']                    = self.config['gates']
+        items['Wrec_init']                = self.config['Wrec_init']
+        items['rho (policy)']             = self.config['rho']
+        items['rho (baseline)']           = self.config['baseline_rho']
         items['dt']                       = str(self.dt) + ' ms'
+        items['tau']                      = str(self.config['tau']) + ' ms'
+        items['alpha']                    = self.dt/self.config['tau']
         items['tau_reward']               = str(self.config['tau_reward']) + ' ms'
         items['var_rec (policy)']         = self.config['var_rec']
         items['var_rec (baseline)']       = self.config['baseline_var_rec']
+        items['scaled var_rec (policy)']  = self.scaled_var_rec
+        items['L2_x (policy)']            = self.config['L2_x']
+        items['beta_entropy']             = self.config['beta_entropy']
         items['Learning rate (policy)']   = self.config['lr']
         items['Learning rate (baseline)'] = self.config['baseline_lr']
+        items['Seed (weight init)']       = '{} -> policy {}, baseline {}'.format(
+            self.config.get('weight_seed'), self.config.get('policy_seed'),
+            self.config.get('baseline_seed'))
+        items['Seed (stimulus)']          = '{} -> rng {}'.format(
+            self.config.get('stim_seed'), self.config.get('seed'))
+        items['Seed (action)']            = '{} -> rng {}, noise {}'.format(
+            self.config.get('action_seed'), self.config.get('action_rng_seed'),
+            self.config.get('noise_rng_seed'))
         items['Max time steps']           = self.Tmax
         items['Num. trials (gradient)']   = self.config['n_gradient']
         items['Num. trials (validation)'] = self.config['n_validation']
@@ -645,6 +715,9 @@ class PolicyGradient(object):
             # Random number generator
             print("Resetting RNG state.")
             self.rng.set_state(self.save['rng_state'])
+            if 'rng_action_state' in self.save:
+                self.rng_action.set_state(self.save['rng_action_state'])
+                self.rng_noise.set_state(self.save['rng_noise_state'])
 
             # Keep track of best results
             best_iter            = self.save['best_iter']
@@ -710,7 +783,9 @@ class PolicyGradient(object):
                         print("After {} updates ({})".format(iter_, elapsed))
 
                         # RNG state
-                        rng_state = self.rng.get_state()
+                        rng_state        = self.rng.get_state()
+                        rng_action_state = self.rng_action.get_state()
+                        rng_noise_state  = self.rng_noise.get_state()
 
                         # Trials
                         trials = [self.task.get_condition(self.rng, self.dt)
@@ -765,6 +840,8 @@ class PolicyGradient(object):
                             'best_policy_params':      best_params,
                             'best_baseline_params':    best_baseline_params,
                             'rng_state':               rng_state,
+                            'rng_action_state':        rng_action_state,
+                            'rng_noise_state':         rng_noise_state,
                             'init':                    init,
                             'init_b':                  init_b,
                             'perf':                    perf,
@@ -808,6 +885,17 @@ class PolicyGradient(object):
                             V[k] = np.sum(R[k:]*M[k:], axis=0)
                         error = np.sqrt(np.sum((Z_b - V)**2*M)/np.sum(M))
                         items['Prediction error'] = '{}'.format(error)
+
+                        # Mean softmax action probability over valid (t, trial) steps, one
+                        # number per action, in the order given by config['actions']. Z is
+                        # exp(log-softmax), i.e. already a probability, not a raw logit.
+                        M_action = (np.tile(M.T, (Z.shape[-1], 1, 1))).T
+                        mean_action_probs = (Z*M_action).sum(axis=(0, 1))/np.sum(M)
+                        action_names = sorted(self.config['actions'],
+                                              key=self.config['actions'].get)
+                        items['P(action)'] = ', '.join(
+                            '{}={:.4f}'.format(name, p)
+                            for name, p in zip(action_names, mean_action_probs))
 
                         # Gradient norms
                         if len(grad_norms_policy) > 0:
@@ -853,6 +941,8 @@ class PolicyGradient(object):
                             'current_policy_params':   self.policy_net.get_values(),
                             'current_baseline_params': self.baseline_net.get_values(),
                             'rng_state':               self.rng.get_state(),
+                            'rng_action_state':        self.rng_action.get_state(),
+                            'rng_noise_state':         self.rng_noise.get_state(),
                             'init':                    init,
                             'init_b':                  init_b,
                             'perf':                    perf,
@@ -932,11 +1022,19 @@ class PolicyGradient(object):
                 # Update policy
                 #-------------------------------------------------------------------------
 
+                # Mdec == M except that steps before trial['dec_t0'] are zeroed, so the
+                # REINFORCE score function only sees decision-epoch actions. Tasks with no
+                # 'dec_t0' (dec_t0 defaults to 0) are unaffected.
+                Mdec = np.zeros_like(M)
+                for k, trial in enumerate(trials):
+                    dec_t0 = trial.get('dec_t0', 0)
+                    Mdec[dec_t0:, k] = M[dec_t0:, k]
+
                 if use_x0:
                     args = [x0]
                 else:
                     args = []
-                args += [U[:-1], Q, A, R, b, M, lr]
+                args += [U[:-1], Q, A, R, b, M, Mdec, lr]
                 norm = update_policy(*args)
 
                 norm = float(norm)

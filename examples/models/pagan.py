@@ -19,13 +19,17 @@ than by the nominal pulse ratio, so downstream analyses must bin trials by the r
 integral rather than by the nominal stimulus strength.
 
 Note that every key of pyrl.configs.default is harvested from this module's namespace, so
-module-level names must avoid `N`, `dt`, `lr`, `tau`, `p0`, `rho`, `Win`, `bout`, etc.
+module-level names must avoid `N`, `dt`, `lr`, `tau`, `p0`, `rho`, `Win`, `bout`,
+`f_hidden`, `gates`, `Wrec_init`, etc. `Performance` below is deliberately one of these
+harvested names - it is how pyrl.model.Model picks up a task-specific performance class
+instead of the default Performance2AFC.
 """
 from __future__ import division
 
 import numpy as np
 
-from pyrl import tasktools
+from pyrl             import tasktools, utils
+from pyrl.performance  import Performance2AFC
 
 # Inputs
 inputs = tasktools.to_map('LMR', 'HML', 'LOC', 'FREQ')
@@ -44,24 +48,45 @@ n_gradient   = n_conditions
 n_validation = 50*n_conditions
 max_iter     = 5000
 
-# Validate (and write a parameter checkpoint) this often. The default of 50 is too coarse here:
-# the task reaches criterion in ~100 updates, which would leave only three points on the learning
-# curve and three checkpoints to analyse.
-checkfreq    = 10
-
 # Total pulse rate (Hz) across the four sub-streams
 pulse_rate = 40
 
-# Rewards
+# Rewards. Only a correct decision pays. An incorrect decision, fixation anywhere, and
+# L/R before the decision epoch are all worth nothing, so the only way for the policy to
+# earn reward is to decide, in the decision epoch, correctly.
+#
+# R_ABORTED is no longer reachable through `get_step` - nothing aborts a trial any more -
+# but it is still consumed by the harness as `R_TERMINAL`, the reward for a trial that
+# reaches the end of the buffer without ever deciding (`abort_on_last_t`), and as the
+# baseline network's output bias.
 R_ABORTED   = -1
 R_CORRECT   = +1
-R_INCORRECT = -1
+R_INCORRECT = 0
 
-# Epoch durations. There is no separate fixation epoch: fixation is the correct action
-# throughout the stimulus, and the offset of the context cue serves as the go cue.
-stimulus = 1300
-decision = 2000
-tmax     = stimulus + decision
+# Epoch durations. There is no separate fixation epoch: the stimulus epoch is simply the
+# period in which no action has any consequence, and the offset of the context cue serves
+# as the go cue.
+#
+# Curriculum: `stimulus` starts short and is grown by `update()` below as training
+# progresses. `tmax` is a required config key harvested once, at Model construction, into
+# the fixed trial-buffer size, so it is pinned to the *final* total duration regardless of
+# the current curriculum stage - growing `stimulus` therefore never needs a buffer resize
+# or a Theano recompile. The unused buffer tail while stimulus < stimulus_max is harmless:
+# trials still end at the choice exactly as before.
+stimulus_max = 1300
+decision     = 2000
+tmax         = stimulus_max + decision
+
+# Current (curriculum) stimulus duration, in ms. Grown by `update()`. Set to `stimulus_max`
+# to disable the curriculum (update()'s `stimulus >= stimulus_max` guard then makes it a
+# no-op every checkpoint); set to a shorter value (e.g. 400) to re-enable it.
+stimulus = stimulus_max
+
+# Grow `stimulus` by this many ms each time the threshold below is met.
+STIMULUS_STEP = 50
+
+# P(choice) required, at the *current* stimulus length, to grow it further.
+P_CHOICE_THRESHOLD = 0.70
 
 def get_condition(rng, dt, context={}):
     #-------------------------------------------------------------------------------------
@@ -70,7 +95,7 @@ def get_condition(rng, dt, context={}):
 
     durations = {
         'stimulus': (0, stimulus),
-        'decision': (stimulus, tmax),
+        'decision': (stimulus, stimulus + decision),
         'tmax':     tmax
         }
     time, epochs = tasktools.get_epochs_idx(dt, durations)
@@ -171,13 +196,15 @@ def get_step(rng, dt, trial, t, a):
     # several hundred indices on every step of every trial.
     #-------------------------------------------------------------------------------------
 
+    # Before the decision epoch every action is a null action: CHOOSE-LEFT and
+    # CHOOSE-RIGHT are ignored rather than aborting the trial, and nothing is paid either
+    # way, so breaking fixation early costs the policy nothing but the chance to keep
+    # integrating. From dec_t0 on, L/R ends the trial and only a correct choice pays,
+    # while continued fixation is worth nothing and simply lets the trial run on.
     status = {'continue': True}
     reward = 0
-    if t-1 < trial['dec_t0']:
-        if a != actions['FIXATE']:
-            status['continue'] = False
-            reward = R_ABORTED
-    elif a == actions['CHOOSE-LEFT'] or a == actions['CHOOSE-RIGHT']:
+    if (t-1 >= trial['dec_t0']
+            and a in (actions['CHOOSE-LEFT'], actions['CHOOSE-RIGHT'])):
         if a == actions['CHOOSE-LEFT']:
             choice = 'L'
         else:
@@ -190,6 +217,13 @@ def get_step(rng, dt, trial, t, a):
             reward = R_CORRECT
         else:
             reward = R_INCORRECT
+    elif a in (actions['CHOOSE-LEFT'], actions['CHOOSE-RIGHT']):
+        # Null L/R during the stimulus epoch: worth nothing, but recorded on `trial` (which
+        # persists for the whole trial) so that the final status - the only one seen by
+        # Performance.update() - can report whether it happened. Diagnostic only; see
+        # Performance.display() below.
+        trial['stim_choice'] = True
+    status['stim_choice'] = trial.get('stim_choice', False)
 
     #-------------------------------------------------------------------------------------
     # Inputs
@@ -214,7 +248,57 @@ def get_step(rng, dt, trial, t, a):
 
     return u, reward, status
 
-def terminate(perf):
-    p_decision, p_correct = tasktools.correct_2AFC(perf)
+class Performance(Performance2AFC):
+    """
+    Adds P(choice|stim) - the fraction of trials with at least one (null) CHOOSE-LEFT/RIGHT
+    during the stimulus epoch - to the base P(choice)/P(correct|choice), which already
+    measure P(choice|decision epoch) and accuracy given a decision. A P(choice|stim) that
+    stays high while P(choice) does not rise would indicate the policy is still trying to
+    decide early rather than waiting out the stimulus epoch, even though such attempts are
+    now null actions rather than aborts.
+    """
+    def __init__(self):
+        super(Performance, self).__init__()
+        self.stim_choices = []
 
-    return p_decision >= 0.99 and p_correct >= 0.85
+    def update(self, trial, status):
+        super(Performance, self).update(trial, status)
+        self.stim_choices.append(status.get('stim_choice', False))
+
+    def display(self, output=True):
+        items = super(Performance, self).display(output=False)
+
+        n_trials      = self.n_trials
+        n_stim_choice = sum(self.stim_choices)
+        items['P(choice|stim)'] = '{}/{} = {:.3f}'.format(n_stim_choice, n_trials,
+                                                           n_stim_choice/n_trials)
+
+        if output:
+            utils.print_dict(items)
+        return items
+
+def terminate(perf):
+    # Early stopping disabled (permanent, deliberate change): every pagan-task run now
+    # trains for the full `max_iter` budget. Motivated by the 100-weight-seed sweep
+    # (examples/sweep_weight100.py), which needs uniform-length runs for checkpoint-aligned
+    # comparison across seeds.
+    return False
+
+def update(perf):
+    """
+    Curriculum hook, called once per checkpoint (every `checkfreq` iterations) with the
+    `Performance2AFC` from that checkpoint's own validation batch - the same trials used
+    to print P(choice) already, so this adds no extra evaluation cost. Grows `stimulus` by
+    `STIMULUS_STEP` ms whenever P(choice) at the *current* stimulus length reaches
+    `P_CHOICE_THRESHOLD`, up to `stimulus_max`.
+    """
+    global stimulus
+
+    if stimulus >= stimulus_max:
+        return
+
+    p_decision, _ = tasktools.correct_2AFC(perf)
+    if p_decision >= P_CHOICE_THRESHOLD:
+        stimulus = min(stimulus + STIMULUS_STEP, stimulus_max)
+        print("[ pagan ] P(choice) = {:.3f} >= {:.2f}: stimulus -> {} ms"
+              .format(p_decision, P_CHOICE_THRESHOLD, stimulus))

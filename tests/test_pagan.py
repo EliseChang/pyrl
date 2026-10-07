@@ -11,6 +11,7 @@ policy gradient networks and therefore imports Theano; skip it with --no-theano.
 from __future__ import division, print_function
 
 import imp
+import math
 import os
 import sys
 import time
@@ -104,7 +105,7 @@ def test_module_contract():
     # Every configs.default key is silently harvested from the module namespace, so an
     # innocuous module-level name like `N` would become a network hyperparameter.
     harvested = set(vars(m)) & set(configs.default)
-    assert harvested == set(['R_ABORTED', 'max_iter', 'checkfreq']), \
+    assert harvested == set(['R_ABORTED', 'max_iter', 'Performance']), \
         'unexpected config keys in module namespace: {}'.format(harvested)
 
     assert len(m.inputs)  == 4, m.inputs
@@ -113,7 +114,7 @@ def test_module_contract():
     assert m.n_gradient   == 72, m.n_gradient
     assert m.n_validation == 3600, m.n_validation
     assert m.tmax == 3300, m.tmax
-    assert (m.R_ABORTED, m.R_CORRECT, m.R_INCORRECT) == (-1, +1, -1)
+    assert (m.R_ABORTED, m.R_CORRECT, m.R_INCORRECT) == (-1, +1, 0)
 
     check('module contract')
 
@@ -125,16 +126,61 @@ def test_epochs():
     rng   = np.random.RandomState(0)
     trial = m.get_condition(rng, DT)
 
+    # Default (no curriculum): `stimulus` = stimulus_max = 1300 ms = 130 steps, `decision` is
+    # a fixed 2000 ms = 200 steps regardless of curriculum stage, and the buffer (`tmax`,
+    # hence Tmax()) is pinned to the full task's total duration (3300 ms) so it does not
+    # shrink with `stimulus`.
     assert trial['epochs']['stimulus'] == list(range(0, 130)),   trial['epochs']['stimulus'][:5]
     assert trial['epochs']['decision'] == list(range(130, 330)), trial['epochs']['decision'][:5]
     assert len(trial['time']) == 331 == Tmax()
-    assert trial['stim_t0'] == 1,   trial['stim_t0']
+    assert trial['stim_t0'] == 1,    trial['stim_t0']
     assert trial['dec_t0']  == 130, trial['dec_t0']
     assert len(trial['lmr']) == len(trial['hml']) == 129
     assert trial['lmr'].dtype == np.int16
     assert trial['hml'].dtype == np.int16
 
     check('epoch and index invariants')
+
+#/////////////////////////////////////////////////////////////////////////////////////////
+# 2b. Curriculum
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+def test_curriculum():
+    """
+    `update()` must grow `stimulus` by STIMULUS_STEP exactly when P(choice) on the
+    checkpoint's own validation batch reaches P_CHOICE_THRESHOLD, and never past
+    stimulus_max. Restores `m.stimulus` on exit so later tests still see the default.
+    """
+    saved_stimulus = m.stimulus
+    try:
+        m.stimulus = 400
+
+        def perf_with(p_decision, n=1000):
+            perf = Performance2AFC()
+            n_decision = int(round(p_decision*n))
+            for i in range(n):
+                status = {'correct': True} if i < n_decision else {}
+                perf.update(None, status)
+            return perf
+
+        # Below threshold: no change.
+        m.update(perf_with(m.P_CHOICE_THRESHOLD - 0.05))
+        assert m.stimulus == 400, m.stimulus
+
+        # At/above threshold: grows by STIMULUS_STEP.
+        m.update(perf_with(m.P_CHOICE_THRESHOLD))
+        assert m.stimulus == 450, m.stimulus
+
+        # Never exceeds stimulus_max, even if held above threshold indefinitely.
+        m.stimulus = m.stimulus_max - 20
+        m.update(perf_with(1.0))
+        assert m.stimulus == m.stimulus_max, m.stimulus
+        m.update(perf_with(1.0))
+        assert m.stimulus == m.stimulus_max, m.stimulus
+    finally:
+        m.stimulus = saved_stimulus
+
+    check('curriculum')
 
 #/////////////////////////////////////////////////////////////////////////////////////////
 # 3. Pulse statistics
@@ -147,7 +193,8 @@ def test_pulse_statistics(n_trials=5000):
     nbins = len(trials[0]['lmr'])
     lam   = m.pulse_rate*DT/1000
 
-    # Expected total pulses per trial = lam*nbins.
+    # Expected total pulses per trial = lam*nbins (nbins = 129 at the default,
+    # no-curriculum stimulus length of 1300 ms).
     expected_total = lam*nbins
     assert abs(expected_total - 51.6) < 0.01, expected_total
 
@@ -194,9 +241,14 @@ def test_pulse_statistics(n_trials=5000):
         predicted = lam*(2*lr - 1)*(2*hl - 1)
         print('  {:>5} {:>5} {:>9.4f} {:>9.4f} {:>9.4f} {:>9.4f}'.format(
             lr, hl, a.var(), b.var(), measured, predicted))
-        assert abs(a.var() - lam) < 0.02, 'lmr per-bin var {} != {}'.format(a.var(), lam)
-        assert abs(b.var() - lam) < 0.02, 'hml per-bin var {} != {}'.format(b.var(), lam)
-        assert abs(measured - predicted) < 0.02, \
+        # Tolerances scale with 1/sqrt(N) (N = len(sub)*nbins) rather than a fixed value, so
+        # the check stays meaningful as `stimulus_max` shrinks nbins from the original 129.
+        N      = len(a)
+        se_var = lam*np.sqrt(2.0/N)
+        se_cov = lam/np.sqrt(N)
+        assert abs(a.var() - lam) < 5*se_var, 'lmr per-bin var {} != {}'.format(a.var(), lam)
+        assert abs(b.var() - lam) < 5*se_var, 'hml per-bin var {} != {}'.format(b.var(), lam)
+        assert abs(measured - predicted) < 5*se_cov, \
             'cov {} vs predicted {} at lr={}, hl={}'.format(measured, predicted, lr, hl)
 
     # Marginals of the sampled conditions.
@@ -213,15 +265,24 @@ def test_pulse_statistics(n_trials=5000):
 
     # The realized side agrees with the nominal side at a rate set by the strength, which
     # also pins down the sign convention (left_right = -1 -> majority left/high ->
-    # positive integral -> 'L').
-    print('  {:>8} {:>10} {:>8}'.format('strength', 'P(match)', 'n'))
-    for strength, lo in [(0.45, 0.74), (0.35, 0.97), (0.25, 0.999)]:
+    # positive integral -> 'L'). Predicted from the Gaussian approximation to a sum of
+    # `nbins` per-bin differences (mean lam*(2*strength-1), var lam), so the check stays
+    # meaningful as `stimulus_max` (and hence nbins) changes, rather than a threshold
+    # calibrated for one specific nbins.
+    print('  {:>8} {:>10} {:>10} {:>8}'.format('strength', 'P(match)', 'predicted', 'n'))
+    for strength in [0.45, 0.35, 0.25]:
         sub = [t for t in trials
                if t['context'] == 'loc' and abs(t['strength_loc'] - strength) < 1e-9]
         match = [np.sign(t['integral_loc']) == -np.sign(t['left_right_loc']) for t in sub]
         p = np.mean(match)
-        print('  {:>8} {:>10.3f} {:>8d}'.format(strength, p, len(sub)))
-        assert p >= lo, 'strength {}: P(match) = {} < {}'.format(strength, p, lo)
+        n = len(sub)
+        z         = abs(2*strength - 1)*np.sqrt(nbins*lam)
+        predicted = 0.5*(1 + math.erf(z/np.sqrt(2)))
+        se        = np.sqrt(predicted*(1 - predicted)/n)
+        lo        = predicted - 5*se
+        print('  {:>8} {:>10.3f} {:>10.3f} {:>8d}'.format(strength, p, predicted, n))
+        assert p >= lo, \
+            'strength {}: P(match) = {} < {} (predicted {})'.format(strength, p, lo, predicted)
 
     check('pulse statistics')
 
@@ -290,20 +351,31 @@ def test_rollouts(n_trials=200):
         assert status['t_choice'] == t_last_legal
 
     #-------------------------------------------------------------------------------------
-    # Breaking fixation
+    # Breaking fixation early is a null action: no reward, no abort
     #-------------------------------------------------------------------------------------
 
     trial = m.get_condition(rng, DT)
     _, rewards, status, t_last = rollout(
         rng, trial, fixate_then(m.actions['CHOOSE-LEFT'], 5))
-    assert rewards[-1] == m.R_ABORTED, rewards[-1]
-    assert status['continue'] is False
+    assert rewards[5] == 0, rewards[5]
+    assert t_last == Tmax() - 1, t_last
     assert 'correct' not in status
-    assert t_last == 5
 
+    # An early L/R must not even be recorded as a choice, so a trial that breaks fixation
+    # and then never decides still counts as no-decision.
     perf = Performance2AFC()
     perf.update(trial, status)
     assert perf.n_trials == 1 and perf.n_decision == 0 and perf.n_correct == 0
+
+    # Every step before dec_t0 is worth nothing, whichever action is taken.
+    def always_left(t, trial):
+        return m.actions['CHOOSE-LEFT']
+
+    _, rewards, status, _ = rollout(rng, trial, always_left)
+    assert all(r == 0 for r in rewards[:trial['dec_t0']-1]), rewards[:trial['dec_t0']-1]
+
+    # ...and the first L/R at or after dec_t0 does end the trial.
+    assert status['t_choice'] == trial['dec_t0'], status
 
     #-------------------------------------------------------------------------------------
     # Never deciding
@@ -371,8 +443,16 @@ def test_forced_conditions():
 #/////////////////////////////////////////////////////////////////////////////////////////
 
 def test_feasibility(n_trials=4000):
-    rng    = np.random.RandomState(4)
-    trials = [m.get_condition(rng, DT) for _ in range(n_trials)]
+    # This checks feasibility of the *full* task (the terminate() criterion the curriculum
+    # is ultimately working towards), not whatever short stimulus the curriculum currently
+    # starts at, so force stimulus = stimulus_max regardless of the module's default.
+    saved_stimulus = m.stimulus
+    m.stimulus = m.stimulus_max
+    try:
+        rng    = np.random.RandomState(4)
+        trials = [m.get_condition(rng, DT) for _ in range(n_trials)]
+    finally:
+        m.stimulus = saved_stimulus
 
     integrals = np.array([t['integral'] for t in trials], dtype=float)
     print('  |integral|: mean {:.1f}, median {:.1f}, P(=0) {:.3f}'.format(
@@ -435,7 +515,158 @@ def test_end_to_end():
     check('end-to-end smoke test')
 
 #/////////////////////////////////////////////////////////////////////////////////////////
-# 8. Checkpoint round-trip (imports Theano, needs a trained run)
+# 7b. RNG stream derivation (no Theano: pyrl.configs imports only numpy)
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+def test_derive_seeds():
+    """
+    Weight init, stimulus generation and action sampling must be separately controllable,
+    and the plain `--seed` path must keep its legacy derivation.
+    """
+    from pyrl import configs
+
+    # Legacy: no stream seeds set, so everything follows --seed as it always did.
+    legacy = configs.derive_seeds(100, {})
+    assert legacy['seed']          == 300
+    assert legacy['policy_seed']   == 301
+    assert legacy['baseline_seed'] == 302
+
+    base = configs.derive_seeds(100, {'weight_seed': None, 'stim_seed': None,
+                                      'action_seed': None})
+    assert base == legacy
+
+    # Each stream moves only its own seeds.
+    w = configs.derive_seeds(100, {'weight_seed': 7})
+    assert (w['policy_seed'], w['baseline_seed']) == (22, 23)
+    assert w['seed'] == legacy['seed']
+    assert w['action_rng_seed'] == legacy['action_rng_seed']
+
+    s = configs.derive_seeds(100, {'stim_seed': 7})
+    assert s['seed'] == 21
+    assert (s['policy_seed'], s['baseline_seed']) == (legacy['policy_seed'],
+                                                      legacy['baseline_seed'])
+    assert s['action_rng_seed'] == legacy['action_rng_seed']
+
+    a = configs.derive_seeds(100, {'action_seed': 7})
+    assert a['action_rng_seed'] == 1000021
+    assert a['noise_rng_seed']  == 2000021
+    assert a['seed'] == legacy['seed']
+    assert (a['policy_seed'], a['baseline_seed']) == (legacy['policy_seed'],
+                                                      legacy['baseline_seed'])
+
+    # No two streams may ever collide, anywhere on the sweep grid.
+    keys = ['policy_seed', 'baseline_seed', 'seed', 'action_rng_seed', 'noise_rng_seed']
+    for wi in range(1, 11):
+        for ti in range(1, 5):
+            d = configs.derive_seeds(0, {'weight_seed': wi, 'stim_seed': ti,
+                                         'action_seed': ti})
+            got = [d[k] for k in keys]
+            assert len(set(got)) == len(got), (wi, ti, got)
+
+    check('RNG stream derivation')
+
+#/////////////////////////////////////////////////////////////////////////////////////////
+# 8. Network architecture options (imports Theano)
+#/////////////////////////////////////////////////////////////////////////////////////////
+
+def test_gated_default_unchanged():
+    """
+    The gated relu GRU is what every existing savefile was trained with, so adding the
+    `f_hidden` and `gates` options must not perturb it.
+    """
+    from pyrl     import matrixtools, nptools
+    from pyrl.gru import GRU
+
+    net = GRU({'Nin': 4, 'N': 20, 'Nout': 3, 'rho': 1.5}, seed=1)
+
+    assert net.gates is True
+    assert net.firing_rate is nptools.relu
+    assert net.get_dim('Win')        == (4, 60), net.get_dim('Win')
+    assert net.get_dim('bin')        == 60
+    assert net.get_dim('Wrec_gates') == (20, 40)
+    assert set(net.params) == set(['Win', 'bin', 'Wrec_gates', 'Wrec', 'Wout',
+                                   'bout', 'x0']), sorted(net.params)
+    assert len(net.step_params) == 5, len(net.step_params)
+
+    # rho is applied to Wrec and to both halves of Wrec_gates.
+    Wrec_gates = net.params['Wrec_gates'].get_value()
+    for W in [net.params['Wrec'].get_value(),
+              Wrec_gates[:,:20], Wrec_gates[:,20:]]:
+        assert abs(matrixtools.spectral_radius(W) - 1.5) < 1e-4, \
+            matrixtools.spectral_radius(W)
+
+    check('gated default unchanged')
+
+def test_vanilla_architecture():
+    """
+    Gates off and tanh rates: a non-gated, non-leaky vanilla RNN by construction.
+    """
+    from pyrl     import matrixtools
+    from pyrl.gru import GRU
+
+    net = GRU({'Nin': 4, 'N': 20, 'Nout': 3, 'rho': 0.8,
+               'gates': False, 'f_hidden': 'tanh', 'alpha': 1}, seed=1)
+
+    # The gate parameters must not merely be untrained, they must not exist.
+    assert 'Wrec_gates' not in net.params, sorted(net.params)
+    assert net.get_dim('Win') == (4, 20), net.get_dim('Win')
+    assert net.get_dim('bin') == 20
+    try:
+        net.get_dim('Wrec_gates')
+    except ValueError:
+        pass
+    else:
+        assert False, 'get_dim(Wrec_gates) should raise when gates are off'
+
+    # ... and therefore cannot receive a gradient.
+    assert all(p.name != 'Wrec_gates' for p in net.trainables), net.trainables
+    assert len(net.step_params) == 4, len(net.step_params)
+
+    # rho now means the spectral radius of the recurrent connectivity, full stop.
+    rho = matrixtools.spectral_radius(net.params['Wrec'].get_value())
+    assert abs(rho - 0.8) < 1e-4, rho
+
+    x = np.array([-1., 0., 1.])
+    assert np.allclose(net.firing_rate(x), np.tanh(x)), net.firing_rate(x)
+
+    check('vanilla architecture')
+
+def test_vanilla_end_to_end():
+    """
+    A gates-off tanh model must run trials through the full policy-gradient machinery.
+    """
+    from pyrl       import configs
+    from pyrl.model import Model
+
+    model  = Model(MODELFILE)
+    config = dict(model.config)
+    config.update({'gates': False, 'f_hidden': 'tanh', 'tau': config['dt'],
+                   'rho': 1.0, 'baseline_rho': 0.8})
+    config.update(configs.derive_seeds(3, {'weight_seed': 3, 'stim_seed': 4,
+                                           'action_seed': 5}))
+    pg = model.get_pg(config, config['seed'])
+
+    # The three streams must be genuinely separate objects: consuming actions or noise
+    # must leave the trial sequence untouched.
+    before = pg.rng.get_state()[1].copy()
+    pg.rng_action.random_sample(10)
+    pg.rng_noise.random_sample(10)
+    assert np.array_equal(pg.rng.get_state()[1], before), 'action/noise disturbed trials'
+
+    # tau = dt is the whole point: it makes the unit non-leaky.
+    assert pg.policy_net.alpha == 1, pg.policy_net.alpha
+    assert abs(pg.scaled_var_rec - 2*config['var_rec']) < 1e-12, pg.scaled_var_rec
+
+    trials = [pg.task.get_condition(pg.rng, pg.dt) for _ in range(8)]
+    rvals  = pg.run_trials(trials, progress_bar=False)
+    U, M   = rvals[0], rvals[7]
+    assert U.shape == (331, 8, 4), U.shape
+    assert np.all(np.isfinite(rvals[6])), 'non-finite rewards'
+
+    check('vanilla end-to-end')
+
+#/////////////////////////////////////////////////////////////////////////////////////////
+# 9. Checkpoint round-trip (imports Theano, needs a trained run)
 #/////////////////////////////////////////////////////////////////////////////////////////
 
 SAVEFILE = os.path.join(REPO, 'examples', 'work', 'data', 'pagan', 'pagan.pkl')
@@ -492,11 +723,16 @@ def test_checkpoints():
 if __name__ == '__main__':
     test_module_contract()
     test_epochs()
+    test_curriculum()
     test_pulse_statistics()
     test_rollouts()
     test_forced_conditions()
     test_feasibility()
+    test_derive_seeds()
     if '--no-theano' not in sys.argv:
         test_end_to_end()
+        test_gated_default_unchanged()
+        test_vanilla_architecture()
+        test_vanilla_end_to_end()
         test_checkpoints()
     print('\nAll checks passed.')

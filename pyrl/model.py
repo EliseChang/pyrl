@@ -44,6 +44,9 @@ class Model(object):
 
                     if 'terminate' in vars(self.spec):
                         setattr(_self, 'terminate', self.spec.terminate)
+
+                    if 'update' in vars(self.spec):
+                        setattr(_self, 'update', self.spec.update)
             self.Task = Task
             self.task = Task()
 
@@ -103,9 +106,7 @@ class Model(object):
         if recover and os.path.isfile(savefile):
             pg = self.get_pg(savefile, load='current')
         else:
-            self.config['seed']          = 3*seed
-            self.config['policy_seed']   = 3*seed + 1
-            self.config['baseline_seed'] = 3*seed + 2
+            self.config.update(configs.derive_seeds(seed, self.config))
             pg = self.get_pg(self.config, self.config['seed'])
 
         # Train

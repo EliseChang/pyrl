@@ -20,8 +20,12 @@ configs_default  = {
     'N':        50,
     'p0':       1,
     'rho':      1.5,
+    'f_hidden': 'relu',
+    'gates':    True,
+    'Wrec_init': 'gamma',
     'f_out':    'softmax',
     'L2_r':     0,
+    'L2_x':     0,
     'Win':      1,
     'Win_mask': None,
     'Wout':     0,
@@ -42,11 +46,15 @@ class GRU(Recurrent):
 
     """
     def get_dim(self, name):
+        # Without gates the two gate blocks of the input weights, and Wrec_gates
+        # entirely, have no effect on the dynamics, so they are not created at all.
         if name == 'Win':
-            return (self.Nin, 3*self.N)
+            return (self.Nin, 3*self.N) if self.gates else (self.Nin, self.N)
         if name == 'bin':
-            return 3*self.N
+            return 3*self.N if self.gates else self.N
         if name == 'Wrec_gates':
+            if not self.gates:
+                raise ValueError('Wrec_gates does not exist when gates are off')
             return (self.N, 2*self.N)
         if name == 'Wrec':
             return (self.N, self.N)
@@ -86,9 +94,16 @@ class GRU(Recurrent):
         # Activations
         #=================================================================================
 
-        # Hidden
-        self.f_hidden    = theanotools.relu
-        self.firing_rate = nptools.relu
+        # Hidden. `firing_rate` matters as much as `f_hidden`: it is what
+        # policygradient.py stores as the activity that later analyses consume.
+        if self.config['f_hidden'] == 'relu':
+            self.f_hidden    = theanotools.relu
+            self.firing_rate = nptools.relu
+        elif self.config['f_hidden'] == 'tanh':
+            self.f_hidden    = tensor.tanh
+            self.firing_rate = np.tanh
+        else:
+            raise ValueError(self.config['f_hidden'])
 
         # Output
         if self.config['f_out'] == 'softmax':
@@ -104,9 +119,10 @@ class GRU(Recurrent):
         # Network shape
         #=================================================================================
 
-        self.Nin  = self.config['Nin']
-        self.N    = self.config['N']
-        self.Nout = self.config['Nout']
+        self.Nin   = self.config['Nin']
+        self.N     = self.config['N']
+        self.Nout  = self.config['Nout']
+        self.gates = self.config['gates']
 
         #=================================================================================
         # Initialize parameters
@@ -154,10 +170,11 @@ class GRU(Recurrent):
                 masks['Wrec'] = M
 
                 # Wrec (gates)
-                M = np.zeros(self.get_dim('Wrec_gates'))
-                for j in xrange(M.shape[1]):
-                    M[rng.permutation(idx)[:K],j] = 1
-                masks['Wrec_gates'] = M
+                if self.gates:
+                    M = np.zeros(self.get_dim('Wrec_gates'))
+                    for j in xrange(M.shape[1]):
+                        M[rng.permutation(idx)[:K],j] = 1
+                    masks['Wrec_gates'] = M
 
             #-----------------------------------------------------------------------------
             # Network parameteres
@@ -165,8 +182,20 @@ class GRU(Recurrent):
 
             params = OrderedDict()
             if self.config['ei'] is None:
+                # `Wrec_init == 'gaussian'` is a single switch for a plain IID-Gaussian
+                # scheme across Win, Wrec and Wout together: std 1/sqrt(fan-in), i.e.
+                # 1/sqrt(Nin) for Win and 1/sqrt(N) for Wrec/Wout. It replaces, for all
+                # three matrices at once, the framework's usual conventions - Win =
+                # config['Win']*sqrt(K)/Nin (K-dependent, set in policygradient.py) and
+                # Wout = config['Wout'] (a fixed constant) - which is why it lives under
+                # the Wrec-named flag rather than three separate ones.
+                gaussian = (self.config['Wrec_init'] == 'gaussian')
+
                 # Input weights
-                params['Win'] = self.config['Win']*rng.normal(size=self.get_dim('Win'))
+                if gaussian:
+                    params['Win'] = rng.normal(size=self.get_dim('Win'))/np.sqrt(self.Nin)
+                else:
+                    params['Win'] = self.config['Win']*rng.normal(size=self.get_dim('Win'))
                 #k = 4
                 #params['Win']  = self.config['Win']*rng.gamma(k, 1/k, size=self.get_dim('Win'))
                 #params['Win'] *= random_sign(rng, self.get_dim('Win'))
@@ -175,17 +204,38 @@ class GRU(Recurrent):
                 params['bin'] = np.zeros(self.get_dim('bin'))
 
                 # Recurrent weights
+                # Keep the original interleaved draw order so that the gated network's
+                # RNG stream, and hence its initialization for a given seed, is unchanged.
                 k = 4
-                params['Wrec_gates']  = rng.gamma(k, 1/k, self.get_dim('Wrec_gates'))
-                params['Wrec']        = rng.gamma(k, 1/k, self.get_dim('Wrec'))
-                params['Wrec_gates'] *= random_sign(rng, self.get_dim('Wrec_gates'))
-                params['Wrec']       *= random_sign(rng, self.get_dim('Wrec'))
+                if self.gates:
+                    params['Wrec_gates'] = rng.gamma(k, 1/k, self.get_dim('Wrec_gates'))
+                if self.config['Wrec_init'] == 'orthogonal':
+                    # A random orthogonal matrix has every eigenvalue on the unit circle, so
+                    # scaling it by rho gives every recurrent mode exactly the same gain rho,
+                    # unlike gamma-distributed weights, whose eigenvalues are spread over a
+                    # disk and include many near zero even after matching the spectral radius.
+                    params['Wrec'], _ = np.linalg.qr(rng.normal(size=self.get_dim('Wrec')))
+                elif gaussian:
+                    # The spectral-radius rescaling below fixes the exact final radius to
+                    # `rho` regardless of this constant, so 1/sqrt(N) here only matters as
+                    # the natural pre-rescaling scale (order-1 spectral radius by the
+                    # circular law), not for the trained network's actual dynamics.
+                    params['Wrec'] = rng.normal(size=self.get_dim('Wrec'))/np.sqrt(self.N)
+                else:
+                    params['Wrec'] = rng.gamma(k, 1/k, self.get_dim('Wrec'))
+                if self.gates:
+                    params['Wrec_gates'] *= random_sign(rng, self.get_dim('Wrec_gates'))
+                if self.config['Wrec_init'] not in ('orthogonal', 'gaussian'):
+                    params['Wrec'] *= random_sign(rng, self.get_dim('Wrec'))
 
                 #params['Wrec_gates'] = rng.normal(size=self.get_dim('Wrec_gates'))
                 #params['Wrec']       = rng.normal(size=self.get_dim('Wrec'))
 
                 # Output weights
-                if self.config['Wout'] > 0:
+                if gaussian:
+                    print("[ {} ] Initialize Wout to IID N(0, 1/N).".format(self.name))
+                    params['Wout'] = rng.normal(size=self.get_dim('Wout'))/np.sqrt(self.N)
+                elif self.config['Wout'] > 0:
                     print("[ {} ] Initialize Wout to random normal.".format(self.name))
                     params['Wout'] = self.config['Wout']*rng.normal(size=self.get_dim('Wout'))
                 else:
@@ -227,21 +277,24 @@ class GRU(Recurrent):
                     params['Wrec'][inh,i] *= totE/totI
                 '''
 
-            # Desired spectral radius
+            # Desired spectral radius. Without gates this is applied to Wrec alone, so
+            # `rho` is exactly the spectral radius of the recurrent connectivity.
             rho = self.config['rho']
 
-            Wrec_gates = params['Wrec_gates'].copy()
-            if 'Wrec_gates' in masks:
-                Wrec_gates *= masks['Wrec_gates']
             Wrec = params['Wrec'].copy()
             if 'Wrec' in masks:
                 Wrec *= masks['Wrec']
 
-            rho0 = matrixtools.spectral_radius(Wrec_gates[:,:self.N])
-            params['Wrec_gates'][:,:self.N] *= rho/rho0
+            if self.gates:
+                Wrec_gates = params['Wrec_gates'].copy()
+                if 'Wrec_gates' in masks:
+                    Wrec_gates *= masks['Wrec_gates']
 
-            rho0 = matrixtools.spectral_radius(Wrec_gates[:,self.N:])
-            params['Wrec_gates'][:,self.N:] *= rho/rho0
+                rho0 = matrixtools.spectral_radius(Wrec_gates[:,:self.N])
+                params['Wrec_gates'][:,:self.N] *= rho/rho0
+
+                rho0 = matrixtools.spectral_radius(Wrec_gates[:,self.N:])
+                params['Wrec_gates'][:,self.N:] *= rho/rho0
 
             rho0 = matrixtools.spectral_radius(Wrec)
             params['Wrec'] *= rho/rho0
@@ -295,31 +348,44 @@ class GRU(Recurrent):
 
         # Leak
         self.alpha = self.config['alpha']
-        print("[ {} ] alpha = {}".format(self.name, self.alpha))
+        print("[ {} ] alpha = {}, f_hidden = {}, gates = {}"
+              .format(self.name, self.alpha, self.config['f_hidden'], self.gates))
 
         #=================================================================================
         # Define a step
         #=================================================================================
 
-        def step(u, q, x_tm1, alpha, Win, bin, Wrec_gates, Wrec):
-            inputs_t     = u.dot(Win) + bin
-            state_inputs = inputs_t[:,:self.N]
-            gate_inputs  = inputs_t[:,self.N:]
+        if self.gates:
+            def step(u, q, x_tm1, alpha, Win, bin, Wrec_gates, Wrec):
+                inputs_t     = u.dot(Win) + bin
+                state_inputs = inputs_t[:,:self.N]
+                gate_inputs  = inputs_t[:,self.N:]
 
-            r_tm1 = self.f_hidden(x_tm1)
+                r_tm1 = self.f_hidden(x_tm1)
 
-            gate_values   = tensor.nnet.sigmoid(r_tm1.dot(Wrec_gates) + gate_inputs)
-            update_values = gate_values[:,:self.N]
-            g = gate_values[:,self.N:]
-            x_t = ((1 - alpha*update_values)*x_tm1
-                   + alpha*update_values*((g*r_tm1).dot(Wrec) + state_inputs + q))
+                gate_values   = tensor.nnet.sigmoid(r_tm1.dot(Wrec_gates) + gate_inputs)
+                update_values = gate_values[:,:self.N]
+                g = gate_values[:,self.N:]
+                x_t = ((1 - alpha*update_values)*x_tm1
+                       + alpha*update_values*((g*r_tm1).dot(Wrec) + state_inputs + q))
 
-            return x_t
+                return x_t
+
+            step_keys = ['Win', 'bin', 'Wrec_gates', 'Wrec']
+        else:
+            # Vanilla RNN: the gates are clamped to 1 by construction, so with alpha = 1
+            # the unit is also non-leaky.
+            def step(u, q, x_tm1, alpha, Win, bin, Wrec):
+                r_tm1 = self.f_hidden(x_tm1)
+
+                return ((1 - alpha)*x_tm1
+                        + alpha*(r_tm1.dot(Wrec) + u.dot(Win) + bin + q))
+
+            step_keys = ['Win', 'bin', 'Wrec']
 
         self.step         = step
         self.step_params  = [self.alpha]
-        self.step_params += [self.get(k)
-                             for k in ['Win', 'bin', 'Wrec_gates', 'Wrec']]
+        self.step_params += [self.get(k) for k in step_keys]
 
     def get_regs(self, x0_, x, M):
         """
@@ -358,9 +424,10 @@ class GRU(Recurrent):
             reg  = tensor.sum(tensor.sqr(W))
             size = tensor.prod(W.shape)
 
-            W     = self.get('Wrec_gates')
-            reg  += tensor.sum(tensor.sqr(W))
-            size += tensor.prod(W.shape)
+            if self.gates:
+                W     = self.get('Wrec_gates')
+                reg  += tensor.sum(tensor.sqr(W))
+                size += tensor.prod(W.shape)
 
             regs += L2_Wrec * reg/size
 
@@ -384,6 +451,24 @@ class GRU(Recurrent):
 
             # Regularization
             regs += L2_r * tensor.sum(tensor.sqr(r)*M_)/tensor.sum(M_)
+
+        #=================================================================================
+        # Pre-activation states (membrane potential x, before f_hidden)
+        #=================================================================================
+
+        L2_x = self.config['L2_x']
+        if L2_x > 0:
+            # Repeat (T, B) -> (T, B, N)
+            M_ = (tensor.tile(M.T, (x.shape[-1], 1, 1))).T
+
+            # Combine t=0 with t>0
+            x_all = tensor.concatenate(
+                [x0_.reshape((1, x0_.shape[0], x0_.shape[1])), x],
+                axis=0
+                )
+
+            # Omega_x = (L2_x / (N*T*B)) * sum(x^2), restricted to valid (unit, time, batch) entries
+            regs += L2_x * tensor.sum(tensor.sqr(x_all)*M_)/tensor.sum(M_)
 
         #=================================================================================
 

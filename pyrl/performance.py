@@ -20,10 +20,15 @@ class Performance2AFC(object):
         self.corrects  = []
         self.choices   = []
         self.t_choices = []
-        #self.rewards   = []
+        # Final action index (into the task's `actions` map) and the undiscounted reward on
+        # the trial's terminating step, both supplied by PolicyGradient.run_trials. Present
+        # for every trial, including trials that ended without a decision.
+        self.actions   = []
+        self.rewards   = []
 
     def update(self, trial, status):
-        #self.rewards.append(reward)
+        self.actions.append(status.get('action'))
+        self.rewards.append(status.get('reward'))
         if 'correct' in status:
             self.decisions.append(True)
             self.corrects.append(status['correct'])
