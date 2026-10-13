@@ -47,6 +47,14 @@ class Model(object):
 
                     if 'update' in vars(self.spec):
                         setattr(_self, 'update', self.spec.update)
+
+                    # Optional per-trial outcome hook (closed-loop schedules such as the
+                    # anti-bias, examples/models/pagan_hist_antibias.py). Added 11 Oct 2026:
+                    # Task passes only the names listed here through to PolicyGradient.
+                    if 'record_outcome' in vars(self.spec):
+                        setattr(_self, 'record_outcome', self.spec.record_outcome)
+                    if 'set_validation' in vars(self.spec):
+                        setattr(_self, 'set_validation', self.spec.set_validation)
             self.Task = Task
             self.task = Task()
 
@@ -105,6 +113,15 @@ class Model(object):
         """
         if recover and os.path.isfile(savefile):
             pg = self.get_pg(savefile, load='current')
+
+            # Honour the training-budget overrides on resume (11 Oct 2026, to keep the
+            # pilot networks on the task for 200k trials). PolicyGradient takes its config from
+            # the savefile when one exists, so without this `--config max_iter=2800` is ignored
+            # and the run stops again at the old max_iter.
+            for k in ('max_iter', 'checkfreq'):
+                if k in self.config and pg.config.get(k) != self.config[k]:
+                    print("[ Model.train ] resume override: {} {} -> {}".format(k, pg.config.get(k), self.config[k]))
+                    pg.config[k] = self.config[k]
         else:
             self.config.update(configs.derive_seeds(seed, self.config))
             pg = self.get_pg(self.config, self.config['seed'])

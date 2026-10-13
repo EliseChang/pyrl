@@ -104,6 +104,17 @@ class PolicyGradient(object):
             # Leak
             alpha = self.dt/config['tau']
 
+            # In continuous mode, every trial's starting state comes from the previous
+            # trial's end (a plain numpy value by the time it reaches the gradient graph,
+            # per run_trials), never from the `x0` shared parameter itself, so `x0` is
+            # disconnected from the loss and must be excluded from `trainables` -- asking
+            # Theano for its gradient otherwise raises DisconnectedInputError.
+            fix          = config['fix']
+            baseline_fix = config['baseline_fix']
+            if config['mode'] == 'continuous':
+                fix          = fix          + ['x0']
+                baseline_fix = baseline_fix + ['x0']
+
             # Policy network
             K = config['p0']*config['N']
             self.policy_config = {
@@ -119,7 +130,7 @@ class PolicyGradient(object):
                 'f_out':    'softmax',
                 'Win':      config['Win']*np.sqrt(K)/config['Nin'],
                 'Win_mask': config['Win_mask'],
-                'fix':      config['fix'],
+                'fix':      fix,
                 'L2_r':     config['L2_r'],
                 'L2_x':     config['L2_x'],
                 'L1_Wrec':  config['L1_Wrec'],
@@ -163,7 +174,7 @@ class PolicyGradient(object):
                 'Win':      config['baseline_Win']*np.sqrt(K)/baseline_Nin,
                 'Win_mask': config['baseline_Win_mask'],
                 'bout':     config['baseline_bout'],
-                'fix':      config['baseline_fix'],
+                'fix':      baseline_fix,
                 'L2_r':     config['baseline_L2_r'],
                 'L1_Wrec':  config['L1_Wrec'],
                 'L2_Wrec':  config['L2_Wrec'],
@@ -481,6 +492,11 @@ class PolicyGradient(object):
                 prev_outcome = (status['choice'], reward_t)
             else:
                 prev_outcome = None
+            # Hand the outcome to the task, for closed-loop schedules such as the lab's
+            # anti-bias (examples/models/pagan_hist_antibias.py). Added 11 Oct 2026; tasks
+            # without the hook are unaffected.
+            if hasattr(self.task, 'record_outcome'):
+                self.task.record_outcome(trial, status, reward_t)
 
             # Save next state if necessary
             if self.mode == 'continuous':
@@ -787,13 +803,19 @@ class PolicyGradient(object):
                         rng_action_state = self.rng_action.get_state()
                         rng_noise_state  = self.rng_noise.get_state()
 
-                        # Trials
+                        # Trials. Tasks with a closed-loop schedule (pagan_hist_antibias)
+                        # are told this is validation, so the batch is drawn 50/50 and not
+                        # counted (hook added 11 Oct 2026).
+                        if hasattr(self.task, 'set_validation'):
+                            self.task.set_validation(True)
                         trials = [self.task.get_condition(self.rng, self.dt)
                                   for i in xrange(n_validation)]
 
                         # Run trials
                         (U, Q, Q_b, Z, Z_b, A, R, M, init_, init_b_, x0_, x0_b_,
                          perf_) = self.run_trials(trials, progress_bar=True)
+                        if hasattr(self.task, 'set_validation'):
+                            self.task.set_validation(False)
                         if hasattr(self.task, 'update'):
                             self.task.update(perf_)
 
@@ -987,6 +1009,13 @@ class PolicyGradient(object):
                     n_gradient = self.task.n_gradient
                 trials = [self.task.get_condition(self.rng, self.dt)
                           for i in xrange(n_gradient)]
+
+                # A session is exactly one training batch: in continuous mode, carried
+                # state resets to x0 at the start of every session (not just once, at the
+                # start of training), so that a session is always the same fixed-length
+                # chain of n_gradient trials and carried state never spans a weight update.
+                if self.mode == 'continuous':
+                    init, init_b = None, None
 
                 # Run trials
                 (U, Q, Q_b, Z, Z_b, A, R, M, init, init_b, x0, x0_b,
