@@ -514,6 +514,23 @@ Expect Stage 1 to hold until about update 155 of 2,800 (30 updates of pre-traini
 opportunities). If the schedule ever stalls the seed stays in Stage 1 for the whole run — accepted
 deliberately, and interpretable.
 
+### One bug the smoke caught, and the one departure from v2
+
+The first `promote` smoke deadlocked in stage 3. On promotion the network engaged on LOC trials and
+declined essentially every FRQ one (validation showed ~0.39 of trials reaching a choice, almost
+exactly 0.5 x the LOC rate — engagement turned out to be context-specific, which is itself worth
+knowing). v2 increments the block clock only on *attempted* trials, so the FRQ block never reached
+its cap, never ended, and training sat in it for 15,000 trials with the attempt counter frozen at
+60 and no reward signal at all. Under `effort2`, where declining is a single decision at step 0 and
+~75% of trials are attempted, the bug is unreachable; under a per-timestep cost with ~60% mid-window
+withdrawal it is fatal.
+
+So `stages4` counts the block clock on every trial **presented**, not only those attempted. That is
+the one deliberate departure from v2: it keeps the intent ("a block cannot last longer than twice
+the rats' median") and makes the cap unconditional. The performance-gated switch is unchanged and
+still runs on attempted trials. `tests/test_pagan_hist_stages4.py` has a regression test that
+declines its way through a whole block and asserts the switch still happens.
+
 ### Two things to read carefully, documented rather than fixed
 
 - **Promotion counts engaged trials only.** A trial is attempted only if `status['choice']` is set,

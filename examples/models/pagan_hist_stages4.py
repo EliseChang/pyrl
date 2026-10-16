@@ -38,7 +38,9 @@ runs.
 Blocks. From stage 3 the task is set by performance-gated blocks (task_switch_min_perf): the
 context switches when the running accuracy over the last 30 attempted trials reaches the stage's
 switch threshold (0.8 for stages 3-6, 0.7 from 7) and the block is at least 20 trials long, or at
-twice the rats' median block length regardless.
+twice the rats' median block length regardless. The block clock counts every trial PRESENTED, not
+only those attempted - the one deliberate departure from v2, and a necessary one; see the comment
+in record_outcome for the deadlock it avoids.
 
 Promotion. Checked at every checkpoint on the running accuracy of *training* trials per task (the
 last 150 attempted trials of the stage): a stage is left when at least 150 trials were attempted
@@ -280,25 +282,43 @@ def record_outcome(trial, status, reward):
 
     if _st['validating'] or _curr.phase() != 'task' or trial.get('stage') is None:
         return
-    if status.get('choice') is None:
-        return                                   # declined or never decided: not an attempted trial
-    task = trial['context']; hit = 1.0 if status.get('correct') else 0.0
-    rec = _st['recent'][task]; rec.append(hit)
-    if len(rec) > MIN_TRIALS: del rec[0]
-    _st['n_attempted'] += 1; _st['block_len'] += 1
     s = stage(); tasks, _, _, _, switch_thr, qab = STAGES[s]
-    # performance-gated task blocks, with the cap at twice the rats' median block length
-    if len(tasks) > 1 and switch_thr is not None and _st['block_len'] >= MIN_BLOCK and (
-            (len(rec) >= WIN and np.mean(rec[-WIN:]) >= switch_thr) or _st['block_len'] >= MAX_BLOCK.get(s, 10 ** 9)):
+    task = trial['context']
+
+    # The block clock counts every trial PRESENTED, not only those attempted. This is the one
+    # deliberate departure from the v2 ladder, and it is not cosmetic: under the per-timestep cost
+    # the network can decline its way through a whole block, and v2 incremented block_len only on
+    # attempted trials, so a block the network refuses never reaches the cap and never ends. The
+    # first stages4 smoke deadlocked exactly there - on promotion to stage 3 the network engaged on
+    # LOC trials and declined essentially every FRQ one, the FRQ block never ended, and training sat
+    # in it for 15,000 trials with no reward signal and the attempt counter frozen at 60. Under
+    # effort2, where the decline is a single decision at step 0 and ~75% of trials are attempted,
+    # the bug was unreachable. Counting presented trials keeps the intent ("a block cannot last
+    # longer than twice the rats' median") and makes the cap unconditional.
+    _st['block_len'] += 1
+
+    if status.get('choice') is not None:
+        hit = 1.0 if status.get('correct') else 0.0
+        rec = _st['recent'][task]; rec.append(hit)
+        if len(rec) > MIN_TRIALS: del rec[0]
+        _st['n_attempted'] += 1
+        # side anti-bias bookkeeping (stages without the quadrant rule)
+        if not qab:
+            ss = _st['side'][task]; ss *= _SAB_DECAY
+            si = 1 if trial['correct_side'] == 'R' else 0; ss[0, si] += hit; ss[1, si] += 1.0
+        # quadrant anti-bias bookkeeping
+        if qab and trial.get('quadrant', 0):
+            sh_sk = _st['q'][task]; sh_sk *= _DECAY
+            qi = trial['quadrant'] - 1; sh_sk[0, qi] += hit; sh_sk[1, qi] += 1.0
+
+    # performance-gated task blocks (on attempted trials, as in the protocol), with the cap at
+    # twice the rats' median block length (on presented trials, see above)
+    rec = _st['recent'][task]
+    if len(tasks) > 1 and switch_thr is not None and (
+            (_st['block_len'] >= MIN_BLOCK and len(rec) >= WIN
+             and np.mean(rec[-WIN:]) >= switch_thr)
+            or _st['block_len'] >= MAX_BLOCK.get(s, 10 ** 9)):
         _st['task'] = 'frq' if task == 'loc' else 'loc'; _st['block_len'] = 0
-    # side anti-bias bookkeeping (stages without the quadrant rule)
-    if not qab:
-        ss = _st['side'][task]; ss *= _SAB_DECAY
-        si = 1 if trial['correct_side'] == 'R' else 0; ss[0, si] += hit; ss[1, si] += 1.0
-    # quadrant anti-bias bookkeeping
-    if qab and trial.get('quadrant', 0):
-        sh_sk = _st['q'][task]; sh_sk *= _DECAY
-        qi = trial['quadrant'] - 1; sh_sk[0, qi] += hit; sh_sk[1, qi] += 1.0
 
 
 def update(perf):

@@ -125,6 +125,59 @@ M.record_outcome(a_trial(), {'choice': 'R', 'correct': False}, 0.9)
 check(M._st['recent']['loc'] == [1.0, 0.0], 'a wrong choice with positive reward still scores 0')
 print()
 
+print('a block the network declines its way through still ends (the stage-3 deadlock)')
+# v2 incremented block_len only on ATTEMPTED trials, so under the per-timestep cost a block the
+# network refuses never reached the cap and never ended: the first stages4 smoke sat in stage 3
+# for 15,000 trials with the attempt counter frozen at 60. The block clock now counts presented
+# trials.
+_curr.set_phase('task')
+reset_ladder()
+S3 = 3 if 3 in M.ORDER else M.ORDER[0]
+saved = M.stage; M.stage = lambda: S3
+try:
+    tasks = M.STAGES[S3][0]
+    if len(tasks) > 1:
+        M._st['task'] = 'loc'
+        cap = M.MAX_BLOCK[S3]
+        # every trial declined: nothing is ever attempted
+        for _ in range(cap + 5):
+            M.record_outcome(a_trial(stage=S3, context=M._st['task']),
+                             {'declined': True, 'declined_where': 'window', 'declined_step': 11}, 0.0)
+            if M._st['task'] != 'loc':
+                break
+        check(M._st['task'] == 'frq',
+              'the block switched to frq after the cap (%d presented trials), with zero attempted'
+              % cap)
+        check(M._st['n_attempted'] == 0, 'and nothing was counted as attempted')
+        check(M._st['block_len'] == 0, 'and the block clock reset')
+    else:
+        check(True, 'arm %s has no two-task stage; block cap not applicable' % M.ARM)
+finally:
+    M.stage = saved
+print()
+
+print('the performance-gated switch still needs attempted trials and a good window')
+_curr.set_phase('task')
+reset_ladder()
+saved = M.stage; M.stage = lambda: S3
+try:
+    tasks, _, _, _, switch_thr, _ = M.STAGES[S3]
+    if len(tasks) > 1:
+        M._st['task'] = 'loc'
+        for _ in range(M.WIN):             # WIN correct, attempted trials: above the threshold
+            M.record_outcome(a_trial(stage=S3, context='loc'), {'choice': 'L', 'correct': True}, 0.45)
+        check(M._st['task'] == 'frq',
+              'switched on %d correct attempted trials (threshold %.1f)' % (M.WIN, switch_thr))
+        reset_ladder(); M._st['task'] = 'loc'
+        for _ in range(M.WIN):             # all wrong: below the threshold, no switch
+            M.record_outcome(a_trial(stage=S3, context='loc'), {'choice': 'L', 'correct': False}, 0.0)
+        check(M._st['task'] == 'loc', 'no switch while accuracy is below the threshold')
+    else:
+        check(True, 'arm %s has no two-task stage' % M.ARM)
+finally:
+    M.stage = saved
+print()
+
 print('update calls the phase clock exactly once')
 _curr.set_phase('task')
 calls = {'n': 0}
