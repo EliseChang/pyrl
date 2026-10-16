@@ -8,12 +8,24 @@ the `pagan_hist*` tasks. This doc reverse-engineers that pipeline from the scrip
 `*_and_dispatch.sh` orchestration around them) so a network trained from this repo lands in the
 same `explorer/` HTML pages as everything else.
 
-**Important**: the measurement scripts themselves live in Marino's separate `rat_pretraining`
-repo (invoked on disk as `~/rat_pretraining/*.py`), not in this `pyrl` repo — this repo only
-needs to produce output in the shape those scripts expect. `pyrl_mechanism.py` also imports
-`solution_space.py` from the `gatsby_talk/solution_space` tree. None of that is bundled here;
-what follows is the contract between a `pyrl` run and that pipeline, so you can either run it
-yourself (if you have those repos) or hand Marino a run that already has the right shape.
+**Where the scripts actually are**: the pipeline scripts described below are bundled in this
+repo under [`tools/measurement/`](tools/measurement/) (`build_network_explorer.py`,
+`explorer_lib.py`, `glm_vs_psytrack.py`, `pyrl_mechanism.py`, `solution_space.py`,
+`activity_summary.py`, `psytrack_on_network.py`, and the `rollout_extract.sh` /
+`rollout_activity.sh` / `complete_records.sh` / `refresh_records.sh` / `collect_and_build.sh` /
+`launch_activity_0071.sh` / `launch_mech_0071.sh` wrappers) — on Marino's machines they live in
+a separate `rat_pretraining` repo (`~/rat_pretraining/*.py`), and that's still the path baked
+into some of the shell scripts' own calls to their siblings (see the caveat at the end of
+section 8), but the files themselves are copied here so you don't need that other repo to read
+or run them. Marino's `models/pyrl_work`'s own top-level training-launch scripts (hostnames and
+paths specific to his HPC machines, but the exact commands that produced every network already
+in the explorer) are bundled under [`tools/launch/`](tools/launch/). Left out of both: ~100
+one-off/debug scripts that were also in `models/scripts/` (not part of the documented pipeline),
+and five small patch/backup files from `models/pyrl_work`'s top level (`model.py`,
+`patch_model.py`, `patch_model2.py`, `patch_pg.py`, `patch_pg2.py`) — these were Marino's own
+tools for text-patching `pyrl/model.py`/`pyrl/policygradient.py` to add the `record_outcome`/
+`set_validation`/resume-override hooks, and that patching is superseded now that those hooks are
+merged directly into this repo's `pyrl/model.py` and `pyrl/policygradient.py`.
 
 ## 1. The five things a network needs to produce
 
@@ -232,7 +244,7 @@ above (or a new one you add to `ARMS`/`CLASSES`).
 
 ## 8. One-shot refresh, for many runs at once
 
-`models/scripts/` has orchestration wrappers for doing all of section 3 across every run of a
+`tools/measurement/` has orchestration wrappers for doing all of section 3 across every run of a
 given model-file prefix on one machine:
 
 - `complete_records.sh <machine> <prefix> <modelfile> [N_PAR]` — make a record for every run
@@ -246,7 +258,15 @@ given model-file prefix on one machine:
   activity (and the run folders themselves) in from wherever they were computed, then rebuild
   the site.
 
-These assume Marino's lab layout (`~/pyrl_work`, `/mnt/big/pyrl_work`, specific hostnames) and
-won't run as-is outside it, but they're the clearest record of the exact flags (checkpoint
-subsampling policy, `trials_per_condition`, parallelism) actually used for the networks already
-in the explorer, if you want a new run measured the same way.
+These assume Marino's lab layout (`~/pyrl_work`, `/mnt/big/pyrl_work`, specific hostnames,
+`~/rat_pretraining` for their own sibling-script calls — e.g. `rollout_extract.sh` still invokes
+`~/rat_pretraining/psytrack_on_network.py` rather than the copy that now sits right next to it in
+`tools/measurement/`) and won't run as-is outside it. They're bundled here anyway as the clearest
+record of the exact flags (checkpoint subsampling policy, `trials_per_condition`, parallelism)
+actually used for the networks already in the explorer, if you want a new run measured the same
+way — adjust the hardcoded paths for your own machine before running them.
+
+`tools/launch/` has the actual training-launch scripts for the base/antibias/effort/stages
+sweeps (`launch_0071_antibias.sh`, `launch_rebel_effort2*.sh`, etc.) — same caveat: hardcoded to
+Marino's machines, but they're the exact `do.py train` invocations (seeds, `--config` overrides,
+`PAGAN_*` env vars) that produced every network currently in the explorer.
