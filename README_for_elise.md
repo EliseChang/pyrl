@@ -529,7 +529,31 @@ So `stages4` counts the block clock on every trial **presented**, not only those
 the one deliberate departure from v2: it keeps the intent ("a block cannot last longer than twice
 the rats' median") and makes the cap unconditional. The performance-gated switch is unchanged and
 still runs on attempted trials. `tests/test_pagan_hist_stages4.py` has a regression test that
-declines its way through a whole block and asserts the switch still happens.
+declines its way through a whole block and asserts the switch still happens. After the fix, the
+re-run smoke shows `attempted` climbing steadily in stage 3 (118 → 750 over ten checkpoints) where
+it had been frozen at 60 indefinitely.
+
+### What the smokes actually say about this design — read before interpreting the run
+
+Three results, all from seed 1 at `NVAL=360`, and together they say where the difficulty is.
+
+1. **The schedule works and the block holds.** Stage 1 held at criterion for 20 checkpoints while
+   the window climbed 450 → 1,250 ms (accuracy on the LOC-only task reaching 0.95-1.0), then
+   promoted to stage 2 and stage 3 as soon as the window was full. The `jump` control shows why the
+   schedule is needed at all: with the window going straight from 20 to 1,300 ms at the hand-off,
+   the fraction of trials reaching a choice goes 0.997 → 0.000 in one checkpoint, 100% mid-window
+   withdrawal at a median step of ~40, and the ladder never starts.
+2. **Engagement is context-specific, and stage 3 is the barrier.** Stage 3 is the first stage with
+   two tasks. There the network engages on LOC trials and declines essentially every FRQ one:
+   validation settles at ~0.37 of trials reaching a choice, almost exactly half the LOC-only rate,
+   and the FRQ accuracy window never accumulates its 50 trials (`frq: None` at every checkpoint).
+   Blocks now rotate properly, so training is productive rather than stuck — but **promotion out of
+   stage 3 needs *both* tasks above 0.70**, so on this evidence the ladder may well stop there.
+3. **That is the run's question, not a defect.** Whether 2,800 updates is enough for engagement to
+   generalise to the second context is exactly what the arm is for, and the smoke only had 500. The
+   thing to watch in the logs is `frq` turning from `None` into a number — that is the moment
+   engagement crosses contexts. If it never does, the result is that the stage ladder's two-task
+   stage is where a per-timestep engagement cost stalls, which is a finding worth having.
 
 ### Two things to read carefully, documented rather than fixed
 
