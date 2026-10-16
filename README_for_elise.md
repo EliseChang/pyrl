@@ -455,3 +455,94 @@ documented there unless specified otherwise. Both trees come out of the same `AR
 same per-run `compute()`, so adding a run to a tree is two edits: an `ARMS` entry giving its
 run-name prefix a class key, and that key in `ELISE_KEYS` (or `MAIN_KEYS`) with a `CLASSES` entry
 describing it. The `tscost` arms are class `e11`.
+
+---
+
+## 11. The stage-ladder run on the per-timestep cost (`stages4`, 16 Oct 2026)
+
+The third run of the engagement line, and the one the original requirements deferred. Where the
+two `tscost` runs of section 9 hand off from the nose-poke pre-training straight to the full task
+and compare *how the presentation window is grown*, this one hands off to the rats' 10-stage
+TaskSwitch ladder. It is the arm that asks whether the graded stage structure — one feature first,
+then both in blocks, then an uninformative distractor, then an informative one — protects
+engagement where the straight hand-off does not. Local, because 0071 was still saturated.
+
+**Model: `examples/models/pagan_hist_stages4.py`.** The ladder of `pagan_hist_stages.py` rebuilt
+on `pagan_hist_tscost` instead of `pagan_hist_effort2`. Everything about the cost is inherited and
+untouched: four actions (so `Nout = 4`), 0.55/130 per engaged timestep, `R_ABORTED = 0`, the
+`PRESTIM`/`STIM0`/`RAMP` machinery, `bout` at the pyrl default.
+
+It is a port of the share's **version 2** ladder, not the **version 1** still committed in this
+repo as `pagan_hist_stages.py`. v2 adds the lab's side anti-bias in stages 1-6, the quadrant
+anti-bias in stage 10 of every arm (so `short` and `full` differ only in whether stages 7-9
+exist), and a block-length cap at twice the rats' median for the stage — the protocol relies on a
+trainer to end a block a stuck rat never ends, and three networks of the first probe sat in one
+task for 30,000-90,000 trials. `pagan_hist_stages.py` is deliberately **not** updated: it is the
+committed record of the `st55` effort2 runs, and changing it would change what those reproduce.
+That v1/v2 divergence between this repo and the share is a known, separate thing.
+
+### Why this file exists: four hooks, and the `stages3` bug class
+
+`pyrl/model.py` binds **one** function per hook name out of the model file's namespace, and a
+`def` shadows whatever the star import brought in — the harness does no chaining. The abandoned
+`pagan_hist_stages3.py` was a three-line copy of the ladder onto `pagan_hist_fixcost` that adapted
+none of this. `tscost` defines all four hooks, so each had to be handled explicitly:
+
+| hook | what `stages4` does | what breaks otherwise |
+|---|---|---|
+| `set_validation` | kept as-is; it already chains through a `hasattr` guard | nothing |
+| `record_outcome` | calls `_eff.record_outcome` **first and unconditionally**, before its own `if _st['validating']: return` | the cost model's diagnostics go silent — every checkpoint prints `no validation trials recorded`. The two filters are *complementary*: `tscost` summarises the validation batch and returns early when not validating, the ladder tracks training-trial accuracy and returns early when validating. Both must see every trial. |
+| `update` | calls `_eff.update(perf)` exactly once; never `_curr.update` or `_base.update` | the nose-poke phases pass twice as fast, or the duration schedule gets a second independent clock — exactly how `stages3` ended up with the ladder and the window on unrelated clocks |
+| `terminate` | `stage() == 10 and _eff.terminate(perf)`, not `_curr.terminate` | `tscost`'s guard against stopping at criterion while the schedule is still running is silently dropped |
+
+`tests/test_pagan_hist_stages4.py` pins all four, and the `record_outcome` test asserts the cost
+model's counter is non-zero — the exact thing `stages3` got wrong.
+
+### The duration schedule runs in Stage 1 only, once in all of training
+
+No new machinery: `tscost.update` already pins the window to `PAGAN_PRESTIM` (20 ms) through the
+pre-training, sets it to `PAGAN_STIM0` (50 ms) at a one-shot hand-off, and grants one +50 ms
+opportunity per checkpoint while P(choice) ≥ 0.70. At the hand-off `stage()` is 1, so the schedule
+runs in Stage 1 by construction. Confining it there is one guard in `update`: **no stage may be
+left while `_base.stimulus < _base.stimulus_max`.** Gating on the window rather than on
+`stage() == 1` is what makes it correct rather than merely convenient — the schedule cannot outlive
+Stage 1, and once the window is full `tscost`'s own `stimulus >= stimulus_max` branch makes it a
+permanent no-op, so "once" needs no latch. With `PAGAN_RAMP=off` the window is full from the
+hand-off and the guard never fires.
+
+Expect Stage 1 to hold until about update 155 of 2,800 (30 updates of pre-training, then 25 growth
+opportunities). If the schedule ever stalls the seed stays in Stage 1 for the whole run — accepted
+deliberately, and interpretable.
+
+### Two things to read carefully, documented rather than fixed
+
+- **Promotion counts engaged trials only.** A trial is attempted only if `status['choice']` is set,
+  which excludes all four of the cost model's non-choice outcomes, and `hit` comes from
+  `status['correct']` rather than from `reward`, so it is immune to the per-step cost and to the
+  quadrant scaling. (`pagan_hist_antibias.record_outcome` uses `hit = reward > 0`, which *would* be
+  corrupted by a negative engagement cost; the ladder's own side anti-bias does not.) So a network
+  declining most trials is slowed toward promotion but never blocked: stage duration and
+  engagement are confounded, and the stage trace must be read alongside the fraction attempted.
+- **The quadrant scaling and the cost interact.** The scaling multiplies the *terminal* reward by
+  4 × p(quadrant) while the cost is charged separately on earlier timesteps, so an attempted
+  correct trial in stages 7-10 nets 4p − 0.55, negative for a rare quadrant (p < 0.1375). Inherent
+  to combining the rats' water-volume scaling with an engagement cost; it makes the expected value
+  of engaging vary by quadrant.
+
+### Arm and launch
+
+One arm, 8 seeds, `NVAL=360` as in the slim local run. Run folders
+`pagan_hist_stages4_g06sc55full_w001..008`, explorer class `e13`. `sc` (stage ladder on the
+per-timestep **c**ost) collides with none of `st55*` (the effort2 ladder), `tc55*` or `tl55*`.
+~9 core-hours, about 1.2 h wall at `JOBS=8`, ~1 GB of training output.
+
+```bash
+MAX_ITER=80 bash tools/launch/smoke_stages4.sh block      # the schedule holding stage 1, ~1 min
+bash tools/launch/smoke_stages4.sh promote                # the schedule completing, then a promotion
+bash tools/launch/smoke_stages4.sh jump                   # the control: a straight jump kills engagement
+JOBS=8 bash tools/launch/queue_stages4_local.sh           # the run
+```
+
+Deferred, each one launcher invocation away now that the model exists: the `short` ladder
+(`sc55short`), the no-pre-training control (`sc55fullctrl`, which picks up `PAGAN_PRETRAIN=0` for
+free), the other two ramp criteria crossed with the ladder, and a `PAGAN_RAMP=off` stage arm.

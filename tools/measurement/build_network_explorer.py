@@ -108,6 +108,10 @@ ARMS = [("pagan_hist_curriculum_curr_", "pretrained_", "pretrained", "base"),
         ("pagan_hist_tscost_g06tl55fix_", "tscostL_rampfixed_", "per-timestep cost 0.55, fixed duration schedule (slim local run)", "e12"),
         ("pagan_hist_tscost_g06tl55cho_", "tscostL_rampchoice_", "per-timestep cost 0.55, P(choice)-gated schedule (slim local run)", "e12"),
         ("pagan_hist_tscost_g06tl55per_", "tscostL_rampperf_", "per-timestep cost 0.55, performance-gated schedule (slim local run)", "e12"),
+        # the stage-ladder run (16 Oct): the rats' 10-stage TaskSwitch ladder on the per-timestep
+        # cost, with the duration schedule confined to stage 1
+        ("pagan_hist_stages4_g06sc55full_", "stages4_full_", "per-timestep cost 0.55, full stage ladder (stages 1-10)", "e13"),
+        ("pagan_hist_stages4_g06sc55short_", "stages4_short_", "per-timestep cost 0.55, stages 1-6 then the full task", "e13"),
         # stage curriculum on the effort v2 network (EFFORT 0.55, pre-trained): the rats' TaskSwitch stages
         ("pagan_hist_stages_st55short_", "stages1-6_effort0.55_", "stages 1-6 then full task (effort 0.55)", "stages"),
         ("pagan_hist_stages_st55full_", "stages1-10_effort0.55_", "stages 1-10 with quadrant anti-bias (effort 0.55)", "stages"),
@@ -328,6 +332,31 @@ CLASSES += [
         0.019, so a network exactly at chance clears the performance arm's 0.55 gate on 2.9% of checkpoints rather
         than 0.4% - roughly 16 growths' worth of noise over a full run, against the 25 that complete the schedule.
         Read that arm's schedule trace alongside its accuracy, not on its own.</p>""",
+        findings="""<p>Not yet run.</p>""")),
+    ("e13", "13. Per-timestep cost and the full stage ladder", dict(
+        description="""<p><b>What it gets.</b> The same network and cost as types 11 and 12 - a decline output
+        available at every timestep, 0.55/130 charged per timestep it is not chosen, no fixation requirement - but
+        where those hand off from the nose-poke pre-training straight to the full task, this hands off to the rats'
+        10-stage TaskSwitch ladder: location task only on the easiest evidence, then both tasks in
+        performance-gated blocks with the other feature's pulses absent, then both features present with the
+        irrelevant one uninformative, then the irrelevant one informative and increasingly hard, then the full
+        task. The lab's side anti-bias is on in stages 1-6 and the quadrant anti-bias from stage 7, with the
+        protocol's reward scaling by 4 x p(quadrant). Promotion needs 150 attempted trials in the stage and every
+        active task above the stage's threshold; there is no demotion, so stage lengths are the network's own
+        rather than the rats' medians. A block also ends at twice the rats' median length for the stage, because
+        the protocol relies on a trainer to end a block a stuck animal never ends.</p>
+        <p><b>The duration schedule runs in stage 1 only, and once in all of training.</b> The presentation window
+        is one step through the pre-training, starts at 50 ms in stage 1 and grows by 50 ms per checkpoint while
+        P(choice) is at least 0.70. No stage can be left while the window is still growing, so the schedule cannot
+        outlive stage 1; once the window is full the schedule is a permanent no-op. Expect stage 1 to hold until
+        about update 155 of 2,800. If the schedule stalls, the seed stays in stage 1 for the whole run - which is
+        itself the result, the ladder never having started because engagement never scaled.</p>
+        <p class="caveat">Two things to read carefully. A trial counts as attempted only if it ended in a choice,
+        so a network that declines most trials is slowed toward promotion but never blocked - stage duration and
+        engagement are confounded, and the stage trace has to be read alongside the fraction of trials attempted.
+        And the quadrant reward scaling multiplies the terminal reward by 4 x p(quadrant) while the engagement cost
+        is charged separately on earlier timesteps, so an attempted correct trial in stages 7-10 nets 4p - 0.55,
+        negative for a rare quadrant: the expected value of engaging varies by quadrant there.</p>""",
         findings="""<p>Not yet run.</p>"""))]
 
 CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
@@ -341,7 +370,7 @@ CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
 # archive.html, and only the runs of its own classes.
 # -----------------------------------------------------------------------------------------
 
-ELISE_KEYS = ("e11", "e12")
+ELISE_KEYS = ("e11", "e12", "e13")
 MAIN_KEYS = tuple(k for k, _, _ in CLASSES if k not in ELISE_KEYS)
 
 TREES = {

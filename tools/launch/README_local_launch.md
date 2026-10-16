@@ -1,25 +1,29 @@
-# The slimmed local `tscost` run (Apple Silicon Mac, `/Users/s2758080/pyrl`)
+# The local engagement runs (Apple Silicon Mac, `/Users/s2758080/pyrl`)
 
 Written 16 Oct 2026 on `mvm-lin-0071`, where the run could not be started: Marino was holding all
 32 cores with a rolling `pagan_hist_evo.py` sweep.
 
-**There are two runs, and this file is about the second one.**
+**There are three runs, and this file is about the two local ones.**
 
-| | full run | slimmed local run |
-|---|---|---|
-| queue | `queue_tscost.sh` | `queue_tscost_local.sh` |
-| where | mvm-lin-0071, when it frees up | the Mac, now |
-| arms | `tc55off` `tc55fix` `tc55cho` `tc55per` | `tl55fix` `tl55cho` `tl55per` |
-| networks | 32 | 24 |
-| validation batch | 720 | 360 |
-| explorer class | `e11` | `e12` |
-| cost | ~56 core-hours | **~28 core-hours** |
+| | full run | slimmed local run | stage-ladder run |
+|---|---|---|---|
+| queue | `queue_tscost.sh` | `queue_tscost_local.sh` | `queue_stages4_local.sh` |
+| model | `pagan_hist_tscost.py` | `pagan_hist_tscost.py` | `pagan_hist_stages4.py` |
+| where | mvm-lin-0071, when it frees up | the Mac | the Mac |
+| after pre-training | straight to the full task | straight to the full task | the 10-stage TaskSwitch ladder |
+| arms | `tc55off` `tc55fix` `tc55cho` `tc55per` | `tl55fix` `tl55cho` `tl55per` | `sc55full` |
+| networks | 32 | 24 | 8 |
+| validation batch | 720 | 360 | 360 |
+| explorer class | `e11` | `e12` | `e13` |
+| cost | ~56 core-hours | ~28 core-hours | **~9 core-hours** |
 
-The full run **stays queued for 0071 exactly as specified** — nothing in the slimming touches it.
-The two are separate runs on separate samples, not two halves of one: the same weight seed gives
+The full run **stays queued for 0071 exactly as specified** — nothing in the slimming or in the
+stage-ladder run touches it.
+All three are separate runs on separate samples, never parts of one. The same weight seed gives
 the same starting weights, but validation draws consume the same stimulus RNG stream as training
-draws, so a 360-trial batch puts every later trial out of step with the 720-trial one. They must
-not be pooled, which is why the arm tags, run folders and explorer classes differ.
+draws, so a 360-trial batch puts every later trial out of step with the 720-trial one; and the
+stage ladder overrides `get_condition` outright, so it diverges from both. They must not be
+pooled, which is why the arm tags, run folders and explorer classes all differ.
 
 The scripts are portable — `$HOME/pyrl` resolves to `/Users/s2758080/pyrl`, so no path edits.
 Everything machine-specific goes through environment variables (`PYRL_PYTHON`, `JOBS`, `MAX_ITER`,
@@ -65,6 +69,9 @@ P(choice) sits near 1.0 once pre-training is done.
 | wall at `JOBS=4` | ~14 h | ~7 h | |
 | disk, training output | ~3.9 GB | **~2.9 GB** | 122 MB/run, measured on `share_rl_rnn/runs/pagan_hist_effort2_g06e255curr_w001` (a 20 MB `<run>.pkl` + 561 checkpoints at ~150 KB) |
 | disk, if you roll out too | +10–20 GB scratch | | then 12 MB/run of `records/`; mechanism 3.0 MB, activity 0.6 MB (means over the 326/277/177 in the share) |
+
+The stage-ladder run has the same per-run cost at `NVAL=360` but only 8 networks: **~9
+core-hours**, ~1.2 h wall at `JOBS=8`, ~1 GB of training output.
 
 The 10.4 ms/trial is measured from `logs/pagan_hist_hist100_w010.log` on *this* box: 230 updates in
 17m12s at 432 trials/update. (An earlier draft of this file said ~96 core-hours for the full run;
@@ -126,9 +133,17 @@ JOBS=1 NVAL=360 bash tools/launch/launch_weak_start.sh tscost tl55cho 1
 #     -> examples/work/data/pagan_hist_tscost_g06tl55cho_w001/, log in logs/weak/
 #     ...then Ctrl-C, and delete that folder and logs/weak/DONE_g06tl55cho
 
-# (d) the run
+# (d) the runs
 JOBS=8 NICE="" nohup bash tools/launch/queue_tscost_local.sh > logs/weak/queue_local.log 2>&1 &
+# ...and, separately, the stage-ladder run (section 11 of README_for_elise.md):
+JOBS=8 NICE="" nohup bash tools/launch/queue_stages4_local.sh > logs/weak/queue_s4.log 2>&1 &
 ```
+
+For the stage-ladder run, (a) and (b) become
+`$PYRL_PYTHON tests/test_pagan_hist_stages4.py` (also worth running with `PAGAN_STAGES=short` and
+`PAGAN_STAGES=none`) and `bash tools/launch/smoke_stages4.sh`, whose three parts prove the
+schedule holding Stage 1, the schedule completing and a real promotion following, and — as a
+control — that a straight jump to the full window kills engagement so the ladder never starts.
 
 Step (a) must pass before (b): it is the cheapest check that nothing was corrupted in transfer and
 it needs no Theano. Expected smoke output, from this box:
@@ -201,7 +216,11 @@ the plan:
 | `tools/launch/launch_weak_start.sh` | the weak-start trainer: portable, `JOBS` pool, `NVAL` |
 | `tools/launch/queue_tscost.sh` | the **full** run, four arms, 720 — for 0071, unchanged |
 | `tools/launch/queue_tscost_local.sh` | the **slim local** run, three arms, 360 |
+| `examples/models/pagan_hist_stages4.py` | the stage ladder on the cost model |
+| `tests/test_pagan_hist_stages4.py` | hook chaining, the Stage-1 block, the ladder per stage |
+| `tools/launch/queue_stages4_local.sh` | the **stage-ladder** run, one arm, 360 |
+| `tools/launch/smoke_stages4.sh` | its three smokes |
 | `tools/launch/smoke_tscost.sh` | the environment check |
 | `tools/launch/README_local_launch.md` | this file |
-| `tools/measurement/build_network_explorer.py` | `--tree elise`; `tc55*` → `e11`, `tl55*` → `e12` |
+| `tools/measurement/build_network_explorer.py` | `--tree elise`; `tc55*` → `e11`, `tl55*` → `e12`, `sc55*` → `e13` |
 | `README_for_elise.md` | sections 9 (the runs) and 10 (the two trees) |

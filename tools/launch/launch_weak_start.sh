@@ -4,7 +4,8 @@
 #
 #   launch_weak_start.sh <model> <arm> <seeds...>
 #
-# <model> is the pagan_hist_<model>.py stem: curriculum | antibias | effort2 | stages | tscost.
+# <model> is the pagan_hist_<model>.py stem: curriculum | antibias | effort2 | stages | initiate |
+# tscost | stages4.
 # <arm> is the arm tag; the run folder is pagan_hist_<model>_g06<arm>_w<seed padded to 3>, which
 # is what build_network_explorer.py's ARMS table pattern-matches on. Per-arm task switches are
 # environment variables (do.py --config cannot set a task module's own globals) and are derived
@@ -102,6 +103,12 @@ case $ARM in t[cl][0-9][0-9]off*) ENV="$ENV PAGAN_RAMP=off" ;; esac
 case $ARM in t[cl][0-9][0-9]fix*) ENV="$ENV PAGAN_RAMP=fixed" ;; esac
 case $ARM in t[cl][0-9][0-9]cho*) ENV="$ENV PAGAN_RAMP=choice" ;; esac
 case $ARM in t[cl][0-9][0-9]per*) ENV="$ENV PAGAN_RAMP=perf" ;; esac
+# the TaskSwitch stage ladder on the per-timestep cost (pagan_hist_stages4). The duration
+# schedule is P(choice)-gated and runs in stage 1 only; stages4 blocks promotion until the window
+# reaches full length, so "once in all of training" needs no extra switch here.
+case $ARM in sc[0-9][0-9]*)       ENV="$ENV PAGAN_TSCOST=0.${ARM:2:2} PAGAN_STIM0=50 PAGAN_RAMP=choice" ;; esac
+case $ARM in sc[0-9][0-9]full*)   ENV="$ENV PAGAN_STAGES=full" ;; esac
+case $ARM in sc[0-9][0-9]short*)  ENV="$ENV PAGAN_STAGES=short" ;; esac
 
 echo "launch_weak_start: model=$MODEL arm=$ARM seeds=$SEEDS jobs=$JOBS nval=${NVAL:-model default}"
 echo "  python=$P"
