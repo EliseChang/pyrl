@@ -270,3 +270,167 @@ way — adjust the hardcoded paths for your own machine before running them.
 sweeps (`launch_0071_antibias.sh`, `launch_rebel_effort2*.sh`, etc.) — same caveat: hardcoded to
 Marino's machines, but they're the exact `do.py train` invocations (seeds, `--config` overrides,
 `PAGAN_*` env vars) that produced every network currently in the explorer.
+
+---
+
+## 9. The per-timestep engagement cost run (`tscost`, 16 Oct 2026)
+
+This is the first run documented in its own explorer tree (section 10). It follows up the
+fixation-cost networks (`pagan_hist_fixcost.py` / `pagan_hist_stages3.py`) that Marino tried on
+13 Oct and set aside — those are in `share_rl_rnn/models/pyrl_work/examples/models/` but were
+deliberately never merged here, and no output from their full launch survives.
+
+**What went wrong with the fixation-cost version, so it is not repeated.** It charged the cost per
+timestep of holding fixation, which is the right idea, but it (a) removed the dedicated decline
+output and signalled withdrawal with `CHOOSE-LEFT`/`CHOOSE-RIGHT`, and (b) made a stimulus-epoch
+`CHOOSE-LEFT`/`RIGHT` an aborting violation — i.e. it restored the fixation requirement that was
+troubleshot out of this project early on (inherited from the original pyrl). Failure (a) is fatal
+on its own: the two choice actions did double duty as the withdrawal action, so every reward
+success that pushed "left" up pushed it up at step 0 too, where it means withdraw, and the policy
+collapsed into declining everything (its smoke log shows P(choice) falling 0.656 → 0.160 *during*
+training). There is also a third, previously unrecorded defect: those arms were launched with
+`PAGAN_STIM0=10`, and at a 10 ms stimulus `pagan.get_condition`'s `stim_t0 = stimulus[0] + 1`
+leaves `nbins = 0`, so **no input was ever delivered to them at all, not even the LOC go cue**.
+One presentation step is `PAGAN_STIM0=20`, not 10.
+
+**The model: `examples/models/pagan_hist_tscost.py`** (full rules in its docstring). Built on
+`pagan_hist_curriculum`. Four actions — `FIXATE`, `CHOOSE-LEFT`, `CHOOSE-RIGHT`, `DECLINE`
+(`Nout = 4`, and because pyrl draws `Wout` last from the weight seed, `Win`/`bin`/`Wrec` are
+bit-identical to the three-action arms and to `effort2` at the same seed, so every comparison
+stays pairwise). No fixation requirement; `DECLINE` is available at every timestep and ends the
+trial for no reward; every timestep of the presentation window on which the network does not
+decline costs `PAGAN_TSCOST/130`, so the full window costs exactly 0.55 and a trial abandoned
+part-way costs only what it used, with no refund. `bout` is left at the pyrl default, so initial
+action probabilities are not handcrafted. No timeout penalty (`R_ABORTED = 0`).
+
+The presentation window is one step (20 ms, `PAGAN_PRESTIM`) through the pre-training; the
+task-phase schedule then starts at `PAGAN_STIM0` = 50 ms and grows by 50 ms at one opportunity per
+checkpoint, taken according to `PAGAN_RAMP` (25 growths to the full length). Early stopping is
+suppressed while the schedule is still running, so a run cannot stop at criterion on a 100 ms
+window.
+
+**Why the schedule starts at 50 ms and not 20.** `correct_side` is the sign of the *realized*
+pulse count (`pagan.py:154-167`), so the label is a deterministic function of what the network saw
+except when that count is exactly zero, where it is a coin flip. An observer reading the pulses
+perfectly therefore scores `1 - P(integral = 0)/2`. With lambda = `pulse_rate`*`dt`/1000 = 0.4
+pulses per bin and `nbins = ms/10 - 1`, by exact Poisson convolution over the three strengths and
+both sides:
+
+| window | input bins | P(integral = 0) | accuracy ceiling |
+|---|---|---|---|
+| 20 ms | 1 | 0.694 | 0.653 |
+| 30 ms | 2 | 0.515 | 0.742 |
+| 50 ms | 4 | 0.334 | **0.833** |
+| 100 ms | 9 | 0.185 | 0.908 |
+| 1,300 ms | 129 | 0.016 | 0.992 |
+
+A one-bin window is two-thirds coin flip and leaves the performance-gated arm only 0.10 of headroom
+over its 0.55 gate; four bins leave 0.28. The ceiling is for an *unselective* responder - a network
+that preferentially declined the zero-count trials could exceed it on the trials it chose, the same
+P(correct|choice) inflation that late declines allow. `PAGAN_PRESTIM` stays at 20 ms, because the
+pre-training window is one presentation step by design, so the hand-off steps 20 -> 50 ms. The
+module default for `PAGAN_STIM0` stays at the full 1,300 ms: a rollout that silently measured a
+50 ms window would corrupt every record.
+
+New environment switches, to add to the table in section 2:
+
+| variable | meaning | default |
+|---|---|---|
+| `PAGAN_TSCOST` | cost of holding the presentation window at its full length | `0.55` |
+| `PAGAN_RAMP` | duration schedule: `off` \| `fixed` \| `choice` \| `perf` | `choice` |
+| `PAGAN_STIM0` | where the schedule starts, in ms. Defaults to the full length so analysis rollouts measure the full task; training passes `50` (four input bins - see the ceiling table below) | `1300` |
+| `PAGAN_PRESTIM` | presentation length during the pre-training phases, in ms | `20` |
+| `PAGAN_RAMP_PCHOICE` | P(choice) the `choice` and `perf` schedules require | `0.70` |
+| `PAGAN_RAMP_PCORRECT` | P(correct\|choice) the `perf` schedule additionally requires | `0.55` |
+| `PAGAN_TIMEOUT` | reward for a trial whose buffer ends with no choice | `0` |
+
+**The arms.** Four, all pre-trained, cost 0.55, 8 seeds each, 2,800 updates, differing only in the
+schedule: `tc55off` (none — straight to 1,300 ms at the hand-off, the control), `tc55fix`
+(unconditional), `tc55cho` (P(choice) ≥ 0.70), `tc55per` (P(choice) ≥ 0.70 and
+P(correct|choice) > 0.55). Run folders `pagan_hist_tscost_g06tc55{off,fix,cho,per}_w001..008`.
+Deferred to a following run: the no-pre-training controls (the same arms with a `ctrl` suffix,
+which picks up `PAGAN_PRETRAIN=0` for free) and the staged curriculum.
+
+**Launching** (`tools/launch/`, the portable successor to Marino's
+`models/scripts/launch_weak_start.sh`, which hardcodes his paths and env). The scripts take
+`PYRL_REPO`, `PYRL_PYTHON`, `JOBS`, `MAX_ITER` and `NICE` from the environment, so they run
+unchanged on a Linux box or an Apple Silicon Mac; `tools/launch/README_local_launch.md` covers the
+local launch, the ~96 core-hour budget, the Python 2.7/Theano situation on arm64, and what still
+has to be checked on the Mac:
+
+```bash
+bash tools/launch/launch_weak_start.sh tscost tc55cho 1 2 3 4 5 6 7 8   # one arm
+bash tools/launch/queue_tscost.sh                                       # all four, staggered
+MAX_ITER=60 bash tools/launch/smoke_tscost.sh                           # 4 modes x 1 seed, nice'd
+```
+
+`launch_weak_start.sh` carries the weak start (`rho=0.6`, critic at `baseline_rho=1.15`), derives
+the task switches from the arm tag, and keeps at most `JOBS` seeds in flight;
+`queue_tscost.sh` runs the four arms in sequence and skips any arm with a `DONE_g06<arm>` marker,
+so it is resumable. **Check the machine first**: 0071 has 32 cores and Marino's sweeps routinely
+use all of them (`ps -eo pcpu,args | grep do.py`).
+
+The `perf` gate is 0.55 and deliberately not 0.50: with ~718 decided trials per validation batch
+the SE of P(correct) at chance is 0.019, so a 0.50 threshold is cleared by a chance network on
+48.5% of checkpoints and the schedule would complete on validation noise alone in ~52 checkpoints.
+0.55 is cleared on 0.4%. The arm may therefore hold a short window for a long time; that is
+accepted, a stalled performance gate being an informative result rather than a failure.
+
+**What the smoke test showed** (`logs/weak/smoke_tc*.log`, 60 updates, seed 1, same seed across
+modes). Through the pre-training all arms are identical and engagement is learned fast: the
+fraction of trials reaching a choice goes 0.42 → 0.77 → 0.96 → 0.99 → 1.00 over the six
+pre-training checkpoints, at a mean cost of 0.008 (two charged steps). Then:
+
+- `off` collapses at the hand-off, exactly as predicted: 0.996 → 0.000 within one checkpoint, with
+  essentially every trial now a *mid-window* withdrawal (not a first-step refusal), at a median
+  step of 42 falling to 31 over the next five checkpoints. The network has learned not to refuse a
+  trial but cannot hold a 130-step window, and withdraws earlier the longer it trains.
+- `fixed` and `choice` advance one step per checkpoint (20 -> 70 -> ... -> 320 ms in the first
+  smoke, which used the old 20 ms start; 50 -> 100 -> ... with the current one), with the choice
+  fraction staying at or above 0.996 the whole way and the mean cost tracking the window
+  (0.008 -> 0.114). The schedule does keep engagement alive where the jump destroys it.
+- `perf` does not move: P(choice) is 1.00 but accuracy sits at 0.48-0.53, below the 0.55 gate, so
+  the window is held. **Raising the start from 20 to 50 ms did not change this** - re-smoked at
+  50 ms for 80 updates (ten task checkpoints), accuracy was still 0.47-0.52 and the gate never
+  opened. The ceiling went from 0.653 to 0.833, so the window is no longer the binding constraint;
+  what binds is learning speed. The network comes out of 2,160 pre-training trials in which the
+  pulses were zeroed and the only signal was trial history, so it has to start using LMR/HML from
+  scratch, and 50 task updates (3,600 trials) is not enough - the other arms take on the order of
+  5,000 trials just to form the line. Whether `perf` ever ramps inside 2,800 updates is the open
+  empirical question of that arm. A stalled `perf` is still an interpretable result (a performance
+  gate is strictly more conservative than a choice gate), but if you want it to move sooner the
+  levers are a larger `PAGAN_STIM0` or a lower `PAGAN_RAMP_PCORRECT` for that arm alone.
+
+Timed-out trials were 0.000 everywhere, so the `PAGAN_TIMEOUT=0` choice turns out not to matter
+much in practice — with four actions and a 200-step decision epoch a trial essentially always ends
+in a choice or a decline.
+
+Unit tests (Python 2.7, no training, seconds): `tests/test_pagan_hist_tscost.py` pins the reward
+structure (44 assertions: the epoch geometry and the go-cue offset at both window lengths, the
+cost of declining at every position, exactly 130 charges at full length, a null in-window
+left/right that is charged but does not end the trial, no refund on a late decline, and the
+outcome bookkeeping) and `tests/test_pagan_hist_tscost_ramp.py <mode>` pins the schedule state
+machine (one mode per process, since `PAGAN_RAMP` is read at import), including the early-stopping
+guard and the `PAGAN_PRETRAIN=0` path.
+
+## 10. Two explorer trees
+
+`tools/measurement/build_network_explorer.py` now takes `--tree`:
+
+```bash
+# records/mechanism/activity roots are overridable by environment, so the builder runs from
+# this account without editing the file (section 6 said to edit or symlink them)
+export EXPLORER_RECORDS=~/records EXPLORER_MECH=~/mechanism EXPLORER_ACT=~/activity
+export EXPLORER_DATA=~/pyrl/examples/work/data
+python tools/measurement/build_network_explorer.py --site ~/explorer_site --tree elise
+python tools/measurement/build_network_explorer.py --site ~/explorer_site --tree main
+```
+
+`--tree main` is the original tree at the site root (the seven types of the 13 Oct talk) and is
+unchanged except for a link, on its front page, to the other one. `--tree elise` builds
+`<site>/elise/` with its own `index.html` and `archive.html`, its own nav (plus an "All models"
+link back up), and only the runs belonging to its own classes — this and the following runs are
+documented there unless specified otherwise. Both trees come out of the same `ARMS` table and the
+same per-run `compute()`, so adding a run to a tree is two edits: an `ARMS` entry giving its
+run-name prefix a class key, and that key in `ELISE_KEYS` (or `MAIN_KEYS`) with a `CLASSES` entry
+describing it. The `tscost` arms are class `e11`.

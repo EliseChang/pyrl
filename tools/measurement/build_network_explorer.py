@@ -42,11 +42,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from explorer_lib import Site, table, fig, grid, card, kv, slider, sparkline, tabs, note, caveat, Raw, esc, keynav  # noqa: E402
 from glm_vs_psytrack import ridge_logistic  # noqa: E402
 
-RECORDS = "/mnt/big/pyrl_work/psytrack/records"
-DATA = os.path.expanduser("~/pyrl_work/examples/work/data")
-PSY = "/mnt/big/pyrl_work/psytrack"
-MECH = "/mnt/big/pyrl_work/mechanism"      # <run>_policy_mechanism.npz from pyrl_mechanism.py
-ACT = "/mnt/big/pyrl_work/activity"        # <run>_activity.npz from activity_summary.py
+# The four input roots. Defaults are Marino's paths on rebel; override by environment so the
+# builder runs from a different account without editing the file (see README_for_elise.md s6).
+RECORDS = os.environ.get("EXPLORER_RECORDS", "/mnt/big/pyrl_work/psytrack/records")
+DATA = os.environ.get("EXPLORER_DATA", os.path.expanduser("~/pyrl_work/examples/work/data"))
+PSY = os.environ.get("EXPLORER_PSY", "/mnt/big/pyrl_work/psytrack")
+MECH = os.environ.get("EXPLORER_MECH", "/mnt/big/pyrl_work/mechanism")      # <run>_policy_mechanism.npz from pyrl_mechanism.py
+ACT = os.environ.get("EXPLORER_ACT", "/mnt/big/pyrl_work/activity")        # <run>_activity.npz from activity_summary.py
 N_GRADIENT = 72
 # the rats' PsyTrack colours, so network and rat figures read the same way
 CLR = {"bias": "tab:blue", "rel": "tab:red", "irr": "tab:green", "histChoice": "tab:orange", "wsls": "tab:purple"}
@@ -93,6 +95,13 @@ ARMS = [("pagan_hist_curriculum_curr_", "pretrained_", "pretrained", "base"),
         ("pagan_hist_fixcost_g06fc55curr_", "weak_fixcost_pretrained_", "weak start, fixation-cost effort, pretrained", "weak_other"),
         ("pagan_hist_stages3_g06fc55short_", "weak_fixcost_stages1-6_", "weak start, fixation-cost effort, stages 1-6 then full task", "weak_other"),
         ("pagan_hist_stages3_g06fc55full_", "weak_fixcost_stages1-10_", "weak start, fixation-cost effort, stages 1-10", "weak_other"),
+        # per-timestep engagement cost (version 4, 16 Oct): a DECLINE output as in effort2, but the
+        # cost accrues per timestep of the stimulus-presentation window, and that window's length is
+        # grown from one step by one of three schedules (the arms) or not at all (the control)
+        ("pagan_hist_tscost_g06tc55off_", "tscost_noramp_", "per-timestep cost 0.55, no duration schedule", "e11"),
+        ("pagan_hist_tscost_g06tc55fix_", "tscost_rampfixed_", "per-timestep cost 0.55, fixed duration schedule", "e11"),
+        ("pagan_hist_tscost_g06tc55cho_", "tscost_rampchoice_", "per-timestep cost 0.55, P(choice)-gated schedule", "e11"),
+        ("pagan_hist_tscost_g06tc55per_", "tscost_rampperf_", "per-timestep cost 0.55, performance-gated schedule", "e11"),
         # stage curriculum on the effort v2 network (EFFORT 0.55, pre-trained): the rats' TaskSwitch stages
         ("pagan_hist_stages_st55short_", "stages1-6_effort0.55_", "stages 1-6 then full task (effort 0.55)", "stages"),
         ("pagan_hist_stages_st55full_", "stages1-10_effort0.55_", "stages 1-10 with quadrant anti-bias (effort 0.55)", "stages"),
@@ -269,7 +278,67 @@ CLASSES = [
         findings="""<p>Vanilla networks build a line attractor during training, end with selection vectors 30-50 degrees apart and spread across the
         triangle; the reward-trained networks keep about 10 slow points, have an eigenvalue at or above 1 from the first checkpoint, selection
         vectors 80-100 degrees apart, and sit in the selection-vector corner.</p>"""))]
+
+# Classes documented in Elise's tree (see TREES below) rather than on the original front page.
+CLASSES += [
+    ("e11", "11. Per-timestep engagement cost and the duration schedule", dict(
+        description="""<p><b>What it gets.</b> The rats' nose-poke pre-training, then the full task, with
+        engagement charged by the timestep. A fourth action, decline, is available at <i>every</i> timestep and
+        ends the trial at once for no reward; every timestep of the stimulus-presentation window on which the
+        network does not decline costs 0.55/130, so holding the window at its full length costs 0.55 (the lump
+        cost of the effort-v2 networks) and a trial abandoned part-way costs only what it used. Whatever has
+        been paid is never refunded. There is no fixation requirement: a left/right action during the window is
+        masked from the reward and does not end the trial, as in the base task. Initial action probabilities are
+        not handcrafted.</p>
+        <p><b>What varies across the arms.</b> The presentation window is one step long through the
+        pre-training, and the four arms differ only in how it grows afterwards: not at all (straight to the full
+        1,300 ms at the hand-off, the control); +50 ms at every checkpoint regardless of performance; +50 ms only
+        when P(choice) is at least 0.70; +50 ms only when P(choice) is at least 0.70 and accuracy on the trials
+        it chose is above 0.55. Eight seeds per arm, the same seeds across arms and across the effort-v2 arms,
+        up to 201,600 trials. Scored on the five trial outcomes - chose, declined on the first timestep,
+        declined inside the window, declined after it, timed out - as well as on accuracy among the trials
+        chosen.</p>
+        <p>This replaces the fixation-cost networks (<code>pagan_hist_fixcost</code>,
+        <code>pagan_hist_stages3</code>) that were tried on 13 Oct and set aside: those had no decline output, so
+        withdrawing and choosing shared the same two actions and the policy collapsed into declining
+        everything.</p>""",
+        findings="""<p>Not yet run.</p>"""))]
+
 CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
+
+# -----------------------------------------------------------------------------------------
+# Documentation trees
+#
+# Two static trees out of one builder, one ARMS table and one per-run cache: the original (the
+# seven types of the 13 Oct talk) at the site root, and Elise's, at <root>/elise, where this and
+# the following runs are documented. `--tree` picks one; each gets its own index.html and
+# archive.html, and only the runs of its own classes.
+# -----------------------------------------------------------------------------------------
+
+ELISE_KEYS = ("e11",)
+MAIN_KEYS = tuple(k for k, _, _ in CLASSES if k not in ELISE_KEYS)
+
+TREES = {
+    "main": dict(
+        sub="", title="Network explorer", index_title="Models",
+        keys=MAIN_KEYS, front=FRONT,
+        lead_note="The seven types of reward-trained network used in the talk, all started with weak recurrent connections. Click a type for what it gets, its numbers, its figures, its mechanism, and the entry into the one-by-one view (arrow keys loop within the class).",
+        archive_note='<a href="archive.html">Other and earlier networks</a>: the weak-start controls, the strong-start networks trained before 13 Oct 2026, and the supervised networks.',
+        archive_blurb="Not used in the talk. The strong-start classes were trained with Elise's default starting weights, which were found on 13 Oct 2026 to give a broad slow region instead of a line and to halve the learning speed.",
+        home_extra='<a href="elise/index.html">Elise\'s runs</a>: the engagement and curriculum runs from 16 Oct 2026 on, documented in their own tree.',
+        nav_extra=()),
+    "elise": dict(
+        sub="elise", title="Elise's runs", index_title="Elise's runs",
+        keys=ELISE_KEYS, front=ELISE_KEYS,
+        lead_note="The engagement and curriculum runs from 16 Oct 2026 on. Click a type for what it gets, its numbers, its figures, its mechanism, and the entry into the one-by-one view (arrow keys loop within the class).",
+        archive_note='<a href="archive.html">Earlier and set-aside versions</a> of these runs.',
+        archive_blurb="Versions of these experiments that were superseded or set aside; kept so the reason is on the record.",
+        home_extra='<a href="../index.html">All the earlier networks</a>: the seven types of the 13 Oct talk and everything on their archive page.',
+        nav_extra=(("../index.html", "All models"),)),
+    }
+
+# Rebound by main() to the tree being built.
+TREE = TREES["main"]
 
 
 def display_name(run):
@@ -1247,7 +1316,7 @@ def population_pages(site, rows):
     links = {"name": lambda r: "networks/%s.html" % r["run"]}
     by_run = population_pages.by_run
     # ---- home: the classes of models
-    home = note("The seven types of reward-trained network used in the talk, all started with weak recurrent connections. Click a type for what it gets, its numbers, its figures, its mechanism, and the entry into the one-by-one view (arrow keys loop within the class).")
+    home = note(TREE["lead_note"])
     cards = []
     archive_cards = []
     for key, title, info in CLASSES:
@@ -1262,10 +1331,11 @@ def population_pages(site, rows):
             meta = ("%d networks, %d arms" % (n, len(arms))) if n else ("runs in progress, nothing collected yet" if key == "stages" else "mechanism only")
         (cards if key in FRONT else archive_cards).append('<h3><a href="classes/%s.html">%s</a></h3><p class="lead">%s</p><p>%s</p>' % (key, esc(title), esc(meta), esc(short)))
     home += grid(cards)
-    home += note('<a href="archive.html">Other and earlier networks</a>: the weak-start controls, the strong-start networks trained before 13 Oct 2026, and the supervised networks.')
-    site.page("archive.html", "Other and earlier networks", note("Not used in the talk. The strong-start classes were trained with Elise's default starting weights, which were found on 13 Oct 2026 to give a broad slow region instead of a line and to halve the learning speed.") + grid(archive_cards))
+    home += note(TREE["archive_note"])
+    site.page("archive.html", "Other and earlier networks", note(TREE["archive_blurb"]) + grid(archive_cards))
+    home += note(TREE["home_extra"])
     home += note('<a href="networks.html">All networks in one sortable table</a> &middot; <a href="pairs.html">all same-seed pairs</a> &middot; <a href="compare.html">PsyTrack vs GLM</a> &middot; <a href="methods.html">methods</a>')
-    site.page("index.html", "Models", home, lead="%d networks in %d classes. Start from a class." % (len(rows), sum(1 for k, _, _ in CLASSES if any(CLASS_OF_ARM.get(arm_of(r)) == k for r in by_run))))
+    site.page("index.html", TREE["index_title"], home, lead="%d networks in %d classes. Start from a class." % (len(rows), sum(1 for k, _, _ in CLASSES if any(CLASS_OF_ARM.get(arm_of(r)) == k for r in by_run))))
     # ---- class pages
     for key, title, info in CLASSES:
         runs_c = [run for run in by_run if CLASS_OF_ARM.get(arm_of(run)) == key]
@@ -1410,23 +1480,36 @@ def main():
     ap.add_argument("--only", default=None, help="substring filter on run names")
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--pages-only", action="store_true", help="skip figure generation (uses the cache)")
+    ap.add_argument("--tree", default="main", choices=sorted(TREES),
+                    help="which documentation tree to build: main (site root) or elise (<site>/elise)")
     a = ap.parse_args()
+
+    # The tree selects the classes, the front page, the site root and the nav; everything below
+    # reads CLASSES/FRONT/TREE as globals, so rebinding them here is the whole switch.
+    global CLASSES, FRONT, TREE
+    TREE = TREES[a.tree]
+    CLASSES = [c for c in CLASSES if c[0] in TREE["keys"]]
+    FRONT = tuple(k for k in TREE["front"] if k in TREE["keys"])
+    root = os.path.join(a.site, TREE["sub"]) if TREE["sub"] else a.site
+
     runs = sorted(os.path.basename(p).replace("_record.npz", "") for p in glob.glob(os.path.join(RECORDS, "*_record.npz")))
-    runs = [r for r in runs if arm_of(r) != "other" and (a.only is None or a.only in r)]
-    print(len(runs), "networks")
-    os.makedirs(os.path.join(a.site, "img"), exist_ok=True)
-    jobs = [(r, a.site, True) for r in runs]
+    runs = [r for r in runs if arm_of(r) != "other"
+            and CLASS_OF_ARM.get(arm_of(r)) in TREE["keys"]
+            and (a.only is None or a.only in r)]
+    print("tree %s -> %s: %d networks" % (a.tree, root, len(runs)))
+    os.makedirs(os.path.join(root, "img"), exist_ok=True)
+    jobs = [(r, root, True) for r in runs]
     if not a.pages_only:
         with Pool(a.workers) as pool:
             for i, (run, err) in enumerate(pool.imap_unordered(work, jobs)):
                 print("%3d/%d %s %s" % (i + 1, len(jobs), run, "" if err is None else "FAILED\n" + err), flush=True)
-    site = Site(a.site, "Network explorer",
-                nav=[("index.html", "Models"), ("networks.html", "All networks"), ("pairs.html", "Pairs"), ("compare.html", "PsyTrack vs GLM"), ("methods.html", "Methods")],
+    site = Site(root, TREE["title"],
+                nav=[("index.html", TREE["index_title"]), ("networks.html", "All networks"), ("pairs.html", "Pairs"), ("compare.html", "PsyTrack vs GLM"), ("methods.html", "Methods")] + list(TREE["nav_extra"]),
                 wiki_html="file:///Users/mpagan/Documents/GitHub/_master/html/wiki/areas/conferences_and_talks.html")
     rows, by_run = [], {}
     for run in runs:
         try:
-            r = compute(run, a.site)
+            r = compute(run, root)
         except Exception as e:
             print("skip", run, e); continue
         rows.append(summary_row(r)); by_run[run] = r
