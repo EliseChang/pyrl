@@ -347,9 +347,29 @@ New environment switches, to add to the table in section 2:
 **The arms.** Four, all pre-trained, cost 0.55, 8 seeds each, 2,800 updates, differing only in the
 schedule: `tc55off` (none — straight to 1,300 ms at the hand-off, the control), `tc55fix`
 (unconditional), `tc55cho` (P(choice) ≥ 0.70), `tc55per` (P(choice) ≥ 0.70 and
-P(correct|choice) > 0.55). Run folders `pagan_hist_tscost_g06tc55{off,fix,cho,per}_w001..008`.
-Deferred to a following run: the no-pre-training controls (the same arms with a `ctrl` suffix,
-which picks up `PAGAN_PRETRAIN=0` for free) and the staged curriculum.
+P(correct|choice) > 0.55). Run folders `pagan_hist_tscost_g06tc55{off,fix,cho,per}_w001..008`,
+explorer class `e11`. Deferred to a following run: the no-pre-training controls (the same arms
+with a `ctrl` suffix, which picks up `PAGAN_PRETRAIN=0` for free) and the staged curriculum.
+
+**There are two runs of this model.** The four-arm run above is queued for 0071 and stays exactly
+as specified. Because 0071 was fully committed by Marino's `pagan_hist_evo` sweep on 16 Oct, a
+**slimmed version was split off to run locally on an Apple Silicon Mac**: three arms (the `off`
+control dropped, the smoke test having already shown that jumping to the full window collapses
+engagement) and a 360-trial validation batch instead of 720, which is where most of the saving is
+— a checkpoint's validation batch is the larger part of the per-update cost, so halving it takes a
+run from 2.25 to 1.50 s/update. 24 runs, ~28 core-hours against ~56 for the full run.
+
+Its arms are `tl55fix`, `tl55cho`, `tl55per` (`tl` rather than `tc`), run folders
+`pagan_hist_tscost_g06tl55*_w001..008`, explorer class `e12` — separate names throughout, because
+**the two runs are not comparable seed-for-seed**: the same weight seed gives the same starting
+weights, but validation draws consume the same stimulus RNG stream as training draws, so a
+360-trial batch puts every later trial out of step with the 720-trial run. They answer the same
+question on separate samples; do not pool them. The smaller batch also halves gate precision: with
+~359 decided trials the SE of accuracy at chance is 0.026 against 0.019, so a chance network
+clears the `perf` arm's 0.55 gate on 2.9% of checkpoints rather than 0.4% — about 16 growths of
+noise over a run, against the 25 that complete the schedule. That arm's schedule trace must be
+read alongside its accuracy. Launch with `tools/launch/queue_tscost_local.sh`;
+`tools/launch/README_local_launch.md` is the full procedure.
 
 **Launching** (`tools/launch/`, the portable successor to Marino's
 `models/scripts/launch_weak_start.sh`, which hardcodes his paths and env). The scripts take
@@ -360,14 +380,15 @@ has to be checked on the Mac:
 
 ```bash
 bash tools/launch/launch_weak_start.sh tscost tc55cho 1 2 3 4 5 6 7 8   # one arm
-bash tools/launch/queue_tscost.sh                                       # all four, staggered
+bash tools/launch/queue_tscost.sh          # the full run: four arms, 720-trial validation
+bash tools/launch/queue_tscost_local.sh    # the slim local run: three arms, NVAL=360
 MAX_ITER=60 bash tools/launch/smoke_tscost.sh                           # 4 modes x 1 seed, nice'd
 ```
 
 `launch_weak_start.sh` carries the weak start (`rho=0.6`, critic at `baseline_rho=1.15`), derives
-the task switches from the arm tag, and keeps at most `JOBS` seeds in flight;
-`queue_tscost.sh` runs the four arms in sequence and skips any arm with a `DONE_g06<arm>` marker,
-so it is resumable. **Check the machine first**: 0071 has 32 cores and Marino's sweeps routinely
+the task switches from the arm tag, keeps at most `JOBS` seeds in flight, and takes `NVAL` as
+`--config n_validation`; both queues run their arms in sequence and skip any arm with a
+`DONE_g06<arm>` marker, so they are resumable. **Check the machine first**: 0071 has 32 cores and Marino's sweeps routinely
 use all of them (`ps -eo pcpu,args | grep do.py`).
 
 The `perf` gate is 0.55 and deliberately not 0.50: with ~718 decided trials per validation batch

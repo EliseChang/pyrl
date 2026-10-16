@@ -15,7 +15,15 @@
 #   PYRL_PYTHON   the Python 2.7 + Theano binary   (default: first of the candidates below)
 #   JOBS          how many seeds to train at once  (default: physical/performance cores, capped 8)
 #   MAX_ITER      updates per run                  (default 2800 = 201,600 trials)
+#   NVAL          validation trials per checkpoint (default: the model's own, 720)
 #   NICE          niceness wrapper                 (default "nice -n 10"; set NICE="" for none)
+#
+# NVAL is passed as --config n_validation, which `do.py train` applies to training only and
+# records in the savefile. It changes the cost of a run (a checkpoint's validation batch is
+# NVAL/checkfreq trials per update, against 72 training trials), the precision of the curriculum
+# gates that read it, and - because validation draws consume the same stimulus RNG stream as
+# training draws - the trial sequence itself. Runs with different NVAL start from identical
+# weights but diverge immediately, so they are NOT seed-comparable and must not be pooled.
 #
 # This is the portable successor to Marino's models/scripts/launch_weak_start.sh in share_rl_rnn,
 # which hardcodes ~/pyrl_work, ~/rat_pretraining and his pyrl27 env. The CFG string is the weak
@@ -71,6 +79,7 @@ CFG="--config Wrec_init=gaussian --config gates=False --config f_hidden=tanh --c
  --config var_rec=0 --config baseline_var_rec=0 --config L2_x=0.001 --config lr=0.004 \
  --config baseline_lr=0.004 --config beta_entropy=0 --config Win=1 \
  --config max_iter=${MAX_ITER:-2800} --config checkfreq=5"
+[ -n "${NVAL:-}" ] && CFG="$CFG --config n_validation=$NVAL"
 
 # arm tag -> task switches. Order matters only in that the cost prefix match must come first.
 ENV=""
@@ -85,13 +94,16 @@ case $ARM in st[0-9][0-9]full)   ENV="$ENV PAGAN_EFFORT=0.${ARM:2:2} PAGAN_STAGE
 # the performance-gated arm has real headroom over its gate from the first task checkpoint.
 # Never 10: at a 10 ms window pagan.get_condition yields zero input bins and no input is
 # delivered at all, not even the go cue, which is the defect the abandoned fixcost arms had.
-case $ARM in tc[0-9][0-9]*)      ENV="$ENV PAGAN_TSCOST=0.${ARM:2:2} PAGAN_STIM0=50" ;; esac
-case $ARM in tc[0-9][0-9]off*)   ENV="$ENV PAGAN_RAMP=off" ;; esac
-case $ARM in tc[0-9][0-9]fix*)   ENV="$ENV PAGAN_RAMP=fixed" ;; esac
-case $ARM in tc[0-9][0-9]cho*)   ENV="$ENV PAGAN_RAMP=choice" ;; esac
-case $ARM in tc[0-9][0-9]per*)   ENV="$ENV PAGAN_RAMP=perf" ;; esac
+# `tc` is the full run (four arms, the model's own 720-trial validation batch); `tl` is the
+# slimmed local run (three arms, NVAL=360) - a separate run with its own names, so the two can
+# never be pooled by the explorer or by a records/ glob. Both read the cost from chars 2-3.
+case $ARM in t[cl][0-9][0-9]*)    ENV="$ENV PAGAN_TSCOST=0.${ARM:2:2} PAGAN_STIM0=50" ;; esac
+case $ARM in t[cl][0-9][0-9]off*) ENV="$ENV PAGAN_RAMP=off" ;; esac
+case $ARM in t[cl][0-9][0-9]fix*) ENV="$ENV PAGAN_RAMP=fixed" ;; esac
+case $ARM in t[cl][0-9][0-9]cho*) ENV="$ENV PAGAN_RAMP=choice" ;; esac
+case $ARM in t[cl][0-9][0-9]per*) ENV="$ENV PAGAN_RAMP=perf" ;; esac
 
-echo "launch_weak_start: model=$MODEL arm=$ARM seeds=$SEEDS jobs=$JOBS"
+echo "launch_weak_start: model=$MODEL arm=$ARM seeds=$SEEDS jobs=$JOBS nval=${NVAL:-model default}"
 echo "  python=$P"
 echo "  env=[$ENV]"
 for w in $SEEDS; do

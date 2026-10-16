@@ -102,6 +102,12 @@ ARMS = [("pagan_hist_curriculum_curr_", "pretrained_", "pretrained", "base"),
         ("pagan_hist_tscost_g06tc55fix_", "tscost_rampfixed_", "per-timestep cost 0.55, fixed duration schedule", "e11"),
         ("pagan_hist_tscost_g06tc55cho_", "tscost_rampchoice_", "per-timestep cost 0.55, P(choice)-gated schedule", "e11"),
         ("pagan_hist_tscost_g06tc55per_", "tscost_rampperf_", "per-timestep cost 0.55, performance-gated schedule", "e11"),
+        # the slimmed local run (16 Oct): three arms, 360-trial validation batch. A separate run,
+        # not comparable seed-for-seed with the tc55 arms above (a different validation batch size
+        # puts the shared stimulus RNG stream out of step), hence its own class.
+        ("pagan_hist_tscost_g06tl55fix_", "tscostL_rampfixed_", "per-timestep cost 0.55, fixed duration schedule (slim local run)", "e12"),
+        ("pagan_hist_tscost_g06tl55cho_", "tscostL_rampchoice_", "per-timestep cost 0.55, P(choice)-gated schedule (slim local run)", "e12"),
+        ("pagan_hist_tscost_g06tl55per_", "tscostL_rampperf_", "per-timestep cost 0.55, performance-gated schedule (slim local run)", "e12"),
         # stage curriculum on the effort v2 network (EFFORT 0.55, pre-trained): the rats' TaskSwitch stages
         ("pagan_hist_stages_st55short_", "stages1-6_effort0.55_", "stages 1-6 then full task (effort 0.55)", "stages"),
         ("pagan_hist_stages_st55full_", "stages1-10_effort0.55_", "stages 1-10 with quadrant anti-bias (effort 0.55)", "stages"),
@@ -302,6 +308,26 @@ CLASSES += [
         <code>pagan_hist_stages3</code>) that were tried on 13 Oct and set aside: those had no decline output, so
         withdrawing and choosing shared the same two actions and the policy collapsed into declining
         everything.</p>""",
+        findings="""<p>Not yet run.</p>""")),
+    ("e12", "12. Per-timestep cost, slimmed local run", dict(
+        description="""<p><b>What it gets.</b> The same network and the same cost as type 11 - a decline output
+        available at every timestep, 0.55/130 charged per timestep it is not chosen, no fixation requirement, the
+        presentation window one step through the pre-training and then grown by 50 ms per checkpoint from a 50 ms
+        start. Eight seeds per arm, up to 201,600 trials.</p>
+        <p><b>How it differs from type 11.</b> Trimmed to run on a laptop while the workstation was busy. The
+        no-schedule control is dropped, because the smoke test had already shown what it does (jumping straight to
+        the full window takes the fraction of trials reaching a choice from 0.996 to 0.000 in one checkpoint, almost
+        all of it mid-window withdrawal); and the validation batch is 360 trials rather than 720, which is where the
+        saving is, a checkpoint's validation batch being the larger part of the per-update cost. Three arms remain:
+        the unconditional schedule, the P(choice)-gated one, and the performance-gated one.</p>
+        <p class="caveat"><b>Not comparable seed-for-seed with type 11.</b> The same weight seed gives the same
+        starting weights, but validation draws consume the same stimulus RNG stream as training draws, so a
+        360-trial batch puts every later trial out of step with the 720-trial run. The two runs answer the same
+        question on separate samples; do not pool them. The smaller batch also halves the precision of the
+        curriculum gates: with about 359 decided trials the standard error of accuracy at chance is 0.026 against
+        0.019, so a network exactly at chance clears the performance arm's 0.55 gate on 2.9% of checkpoints rather
+        than 0.4% - roughly 16 growths' worth of noise over a full run, against the 25 that complete the schedule.
+        Read that arm's schedule trace alongside its accuracy, not on its own.</p>""",
         findings="""<p>Not yet run.</p>"""))]
 
 CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
@@ -315,7 +341,7 @@ CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
 # archive.html, and only the runs of its own classes.
 # -----------------------------------------------------------------------------------------
 
-ELISE_KEYS = ("e11",)
+ELISE_KEYS = ("e11", "e12")
 MAIN_KEYS = tuple(k for k, _, _ in CLASSES if k not in ELISE_KEYS)
 
 TREES = {
