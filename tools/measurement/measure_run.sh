@@ -23,6 +23,11 @@
 #   TPC_A           trials per condition for the activity rollout  (default 2)
 #   MAX_CKPTS       checkpoints for the mechanism search           (default 24)
 #   N_ACTIVITY      checkpoints for the activity rollout           (default 12)
+#   VERIFY          1 (default) runs verify_checkpoints.py first and REFUSES to measure a run
+#                   whose stored weight_seed does not match the _wNNN in its folder name; 0 skips
+#   CLEAN_SCRATCH   1 deletes this run's rollout scratch once all three npz are written. Use it
+#                   when measuring many runs: scratch is ~2.8 GB per run, so a 15-run batch needs
+#                   ~42 GB without it
 #
 # A NOTE ON THE PYTHON 3 INTERPRETER. `~/anaconda3/bin/python3` on mvm-lin-0071 pairs numpy 2.0.2
 # with scipy 1.7.3, so `scipy.special` raises "numpy.dtype size changed, may indicate binary
@@ -76,11 +81,27 @@ fi
 [ -x "${PYRL_PYTHON3:-}" ] || { echo "no usable Python 3 found; set PYRL_PYTHON3 (not base anaconda3, see header)" >&2; exit 2; }
 
 P=$PYRL_PYTHON; PR=$PYRL_PYTHON3
+TOOLS_EARLY=$REPO/tools/measurement
 D=$REPO/examples/work/data/$run
 [ -d "$D" ] || { echo "no such run folder: $D" >&2; exit 2; }
 [ -f "$D/$run.pkl" ] || { echo "missing savefile: $D/$run.pkl" >&2; exit 2; }
 nck=$(ls "$D/checkpoints" 2>/dev/null | grep -c '^iter_[0-9]*\.pkl$' || true)
 [ "$nck" -gt 0 ] || { echo "no checkpoints in $D/checkpoints -- nothing to roll out" >&2; exit 2; }
+
+# ---------------------------------------------------------------- pre-flight verification
+# Checkpoints carry the weight_seed they were trained with, and nothing downstream checks it: a
+# cross-contaminated directory yields a record that is a chimera of two networks with no outward
+# sign. This happened twice in two days transferring runs from the Mac (see verify_checkpoints.py),
+# so verification is on by default and failure is fatal.
+if [ "${VERIFY:-1}" != "0" ]; then
+  if ! "$P" "$TOOLS_EARLY/verify_checkpoints.py" "$run" --data "$REPO/examples/work/data"; then
+    echo "measure_run: REFUSING to measure $run -- checkpoints did not verify (see above)." >&2
+    echo "  Fix the transfer, or quarantine the offenders with:" >&2
+    echo "    $P $TOOLS_EARLY/verify_checkpoints.py $run --quarantine ~/scratch/bad_checkpoints" >&2
+    echo "  Set VERIFY=0 only if you have some other reason to trust the data." >&2
+    exit 1
+  fi
+fi
 
 # the suffix do.py needs: the run name minus the model-file stem
 suffix=_${run#pagan_hist_*_}
@@ -167,6 +188,16 @@ if has mechanism; then
   echo "  [mechanism] fixed points over up to ${MAX_CKPTS:-24} checkpoints"
   OMP_NUM_THREADS=2 $PR "$TOOLS/pyrl_mechanism.py" --run "$run" --max-ckpts "${MAX_CKPTS:-24}" \
      --data "$REPO/examples/work/data" --activity-scratch "$SCRATCH" --out "$MECHANISM" 2>&1 | tail -2
+fi
+
+if [ "${CLEAN_SCRATCH:-0}" = "1" ]; then
+  if [ -f "$RECORDS/${run}_record.npz" ]; then
+    sz=$(du -sh "$SCRATCH/work/pyrl/examples/$run" 2>/dev/null | cut -f1)
+    rm -rf "$SCRATCH/work/pyrl/examples/$run"
+    echo "  [clean] removed $sz of rollout scratch (the npz above are what you keep)"
+  else
+    echo "  [clean] record missing -- keeping scratch" >&2
+  fi
 fi
 
 echo "measure_run: $run finished $(date)"
