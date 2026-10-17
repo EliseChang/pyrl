@@ -3,27 +3,34 @@
 Written 16 Oct 2026 on `mvm-lin-0071`, where the run could not be started: Marino was holding all
 32 cores with a rolling `pagan_hist_evo.py` sweep.
 
-**There are three runs, and this file is about the two local ones.**
+**There are four runs, and this file is about the three local ones.**
 
-| | full run | slimmed local run | stage-ladder run |
-|---|---|---|---|
-| queue | `queue_tscost.sh` | `queue_tscost_local.sh` | `queue_stages4_local.sh` |
-| model | `pagan_hist_tscost.py` | `pagan_hist_tscost.py` | `pagan_hist_stages4.py` |
-| where | mvm-lin-0071, when it frees up | the Mac | the Mac |
-| after pre-training | straight to the full task | straight to the full task | the 10-stage TaskSwitch ladder |
-| arms | `tc55off` `tc55fix` `tc55cho` `tc55per` | `tl55fix` `tl55cho` `tl55per` | `sc55full` |
-| networks | 32 | 24 | 8 |
-| validation batch | 720 | 360 | 360 |
-| explorer class | `e11` | `e12` | `e13` |
-| cost | ~56 core-hours | ~28 core-hours | **~9 core-hours** |
+| | full run | slimmed local run | stage-ladder run | no-pre-training control |
+|---|---|---|---|---|
+| queue | `queue_tscost.sh` | `queue_tscost_local.sh` | `queue_stages4_local.sh` | `queue_tscost_nopretrain.sh` |
+| model | `pagan_hist_tscost.py` | `pagan_hist_tscost.py` | `pagan_hist_stages4.py` | `pagan_hist_tscost.py` |
+| where | mvm-lin-0071, when it frees up | the Mac | the Mac | the Mac |
+| after pre-training | straight to the full task | straight to the full task | the 10-stage TaskSwitch ladder | no pre-training at all |
+| arms | `tc55off` `tc55fix` `tc55cho` `tc55per` | `tl55fix` `tl55cho` `tl55per` | `sc55full` | `tl55offctrl` |
+| networks | 32 | 24 | 8 | 8 |
+| validation batch | 720 | 360 | 360 | 720 |
+| max_iter | 2800 | 2800 | 2800 | **1000** |
+| explorer class | `e11` | `e12` | `e13` | `e14` |
+| cost | ~56 core-hours | ~28 core-hours | ~9 core-hours | **~5 core-hours** |
 
-The full run **stays queued for 0071 exactly as specified** — nothing in the slimming or in the
-stage-ladder run touches it.
-All three are separate runs on separate samples, never parts of one. The same weight seed gives
-the same starting weights, but validation draws consume the same stimulus RNG stream as training
-draws, so a 360-trial batch puts every later trial out of step with the 720-trial one; and the
-stage ladder overrides `get_condition` outright, so it diverges from both. They must not be
-pooled, which is why the arm tags, run folders and explorer classes all differ.
+The full run **stays queued for 0071 exactly as specified** — nothing in the other three runs
+touches it. All four are separate runs on separate samples, never parts of one. The same weight
+seed gives the same starting weights, but validation draws consume the same stimulus RNG stream
+as training draws, so a different `n_validation` puts every later trial out of step with another
+run's; the stage ladder overrides `get_condition` outright; and the no-pre-training control starts
+in a different curriculum phase from everything else. They must not be pooled, which is why the
+arm tags, run folders and explorer classes all differ.
+
+The no-pre-training control is expected to collapse in every seed — that is the point of it (the
+comparison the original requirements deferred), not a sign anything is wrong. Its `max_iter` is
+cut to 1,000 because there is nothing to learn from the rest of the budget once a seed has
+collapsed from the first checkpoint, which a 40-update smoke already confirmed
+(`P(choice) = 0.000` from update 0).
 
 The scripts are portable — `$HOME/pyrl` resolves to `/Users/s2758080/pyrl`, so no path edits.
 Everything machine-specific goes through environment variables (`PYRL_PYTHON`, `JOBS`, `MAX_ITER`,
@@ -133,11 +140,22 @@ JOBS=1 NVAL=360 bash tools/launch/launch_weak_start.sh tscost tl55cho 1
 #     -> examples/work/data/pagan_hist_tscost_g06tl55cho_w001/, log in logs/weak/
 #     ...then Ctrl-C, and delete that folder and logs/weak/DONE_g06tl55cho
 
-# (d) the runs
+# (d) the runs -- independent of each other, run them in any order or concurrently
 JOBS=8 NICE="" nohup bash tools/launch/queue_tscost_local.sh > logs/weak/queue_local.log 2>&1 &
-# ...and, separately, the stage-ladder run (section 11 of README_for_elise.md):
+# ...the stage-ladder run (section 11 of README_for_elise.md):
 JOBS=8 NICE="" nohup bash tools/launch/queue_stages4_local.sh > logs/weak/queue_s4.log 2>&1 &
+# ...and the no-pre-training control (8 runs, max_iter 1000, ~40 min at JOBS=8):
+JOBS=8 NICE="" nohup bash tools/launch/queue_tscost_nopretrain.sh > logs/weak/queue_np.log 2>&1 &
 ```
+
+The no-pre-training control needs no separate smoke beyond (a)/(b): its state machine
+(`PAGAN_PRETRAIN=0`, `PAGAN_RAMP=off`) is already pinned by
+`tests/test_pagan_hist_tscost_ramp.py off pretrain0`, and its collapse was confirmed in a
+40-update real train before this file was written (`P(choice) = 0.000` from update 0, median
+withdrawal step a constant 3) — it is expected to look that way, not a sign of a broken launch.
+
+For the no-pre-training control, (c) becomes
+`JOBS=1 bash tools/launch/launch_weak_start.sh tscost tl55offctrl 1` (same cleanup after).
 
 For the stage-ladder run, (a) and (b) become
 `$PYRL_PYTHON tests/test_pagan_hist_stages4.py` (also worth running with `PAGAN_STAGES=short` and
@@ -210,17 +228,18 @@ the plan:
 
 | file | |
 |---|---|
-| `examples/models/pagan_hist_tscost.py` | the model, shared by both runs |
+| `examples/models/pagan_hist_tscost.py` | the model, shared by all four runs |
 | `tests/test_pagan_hist_tscost.py` | reward structure, 44 assertions |
 | `tests/test_pagan_hist_tscost_ramp.py` | the duration schedule, one mode per process |
 | `tools/launch/launch_weak_start.sh` | the weak-start trainer: portable, `JOBS` pool, `NVAL` |
 | `tools/launch/queue_tscost.sh` | the **full** run, four arms, 720 — for 0071, unchanged |
 | `tools/launch/queue_tscost_local.sh` | the **slim local** run, three arms, 360 |
+| `tools/launch/queue_tscost_nopretrain.sh` | the **no-pre-training control**, one arm, max_iter 1000 |
 | `examples/models/pagan_hist_stages4.py` | the stage ladder on the cost model |
 | `tests/test_pagan_hist_stages4.py` | hook chaining, the Stage-1 block, the ladder per stage |
 | `tools/launch/queue_stages4_local.sh` | the **stage-ladder** run, one arm, 360 |
 | `tools/launch/smoke_stages4.sh` | its three smokes |
 | `tools/launch/smoke_tscost.sh` | the environment check |
 | `tools/launch/README_local_launch.md` | this file |
-| `tools/measurement/build_network_explorer.py` | `--tree elise`; `tc55*` → `e11`, `tl55*` → `e12`, `sc55*` → `e13` |
-| `README_for_elise.md` | sections 9 (the runs) and 10 (the two trees) |
+| `tools/measurement/build_network_explorer.py` | `--tree elise`; `tc55*` → `e11`, `tl55*` → `e12`, `sc55*` → `e13`, `tl55offctrl` → `e14` |
+| `README_for_elise.md` | sections 9 (the runs), 10 (the two trees), 11 (the stage ladder) |

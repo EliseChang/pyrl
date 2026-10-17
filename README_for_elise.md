@@ -351,7 +351,7 @@ P(correct|choice) > 0.55). Run folders `pagan_hist_tscost_g06tc55{off,fix,cho,pe
 explorer class `e11`. Deferred to a following run: the no-pre-training controls (the same arms
 with a `ctrl` suffix, which picks up `PAGAN_PRETRAIN=0` for free) and the staged curriculum.
 
-**There are two runs of this model.** The four-arm run above is queued for 0071 and stays exactly
+**There are four runs of this model.** The four-arm run above is queued for 0071 and stays exactly
 as specified. Because 0071 was fully committed by Marino's `pagan_hist_evo` sweep on 16 Oct, a
 **slimmed version was split off to run locally on an Apple Silicon Mac**: three arms (the `off`
 control dropped, the smoke test having already shown that jumping to the full window collapses
@@ -361,7 +361,7 @@ run from 2.25 to 1.50 s/update. 24 runs, ~28 core-hours against ~56 for the full
 
 Its arms are `tl55fix`, `tl55cho`, `tl55per` (`tl` rather than `tc`), run folders
 `pagan_hist_tscost_g06tl55*_w001..008`, explorer class `e12` — separate names throughout, because
-**the two runs are not comparable seed-for-seed**: the same weight seed gives the same starting
+**none of these runs are comparable seed-for-seed**: the same weight seed gives the same starting
 weights, but validation draws consume the same stimulus RNG stream as training draws, so a
 360-trial batch puts every later trial out of step with the 720-trial run. They answer the same
 question on separate samples; do not pool them. The smaller batch also halves gate precision: with
@@ -371,17 +371,40 @@ noise over a run, against the 25 that complete the schedule. That arm's schedule
 read alongside its accuracy. Launch with `tools/launch/queue_tscost_local.sh`;
 `tools/launch/README_local_launch.md` is the full procedure.
 
+**Fourth: the no-pre-training control** (17 Oct), also local. Straight into the full task from
+the first trial — no nose-poke pre-training, no schedule, the presentation window the full
+1,300 ms from trial 1 (`PAGAN_PRETRAIN=0 PAGAN_RAMP=off`). This is the comparison the original
+requirements deferred ("comparison with no pre-training ... is deferred for following runs"), and
+it isolates what the pre-training window and the duration schedule are actually buying the other
+arms. At init P(DECLINE) = 1/4 per timestep, so P(reaching a potent choice) = 0.75^130 is
+astronomically small and nothing here ever shortens the window to give the network a chance to
+learn otherwise — every seed is expected to collapse to zero engagement from the first checkpoint,
+confirmed in a 40-update smoke (`P(choice) = 0.000` from update 0, median withdrawal step a
+constant 3). `max_iter` is cut to 1,000 (from 2,800) accordingly: there is nothing to learn from
+the later three-quarters of the budget for a seed that collapses on the first checkpoint, and
+cutting it saves about 65% of the compute. `n_validation` is left at the model's default (720,
+not 360) for a well-resolved trajectory — compute is already cheap at 1,000 updates.
+
+One arm, `tl55offctrl`, needed **no launcher changes**: it composes correctly out of existing
+dispatch rules in `launch_weak_start.sh` — `*ctrl` → `PAGAN_PRETRAIN=0`; `t[cl][0-9][0-9]*` →
+`PAGAN_TSCOST=0.55 PAGAN_STIM0=50`; `t[cl][0-9][0-9]off*` → `PAGAN_RAMP=off` (matching `offctrl`
+too). `PAGAN_STIM0=50` is inert here: with `PAGAN_RAMP=off`, `tscost`'s `_task_length()` returns
+`stimulus_max` regardless of `STIM0`. Run folders `pagan_hist_tscost_g06tl55offctrl_w001..008`,
+explorer class `e14`, ~5 core-hours (8 runs × 1,000 updates × ~2.25 s/update), ~40 minutes wall at
+`JOBS=8`. Launch with `bash tools/launch/queue_tscost_nopretrain.sh`.
+
 **Launching** (`tools/launch/`, the portable successor to Marino's
 `models/scripts/launch_weak_start.sh`, which hardcodes his paths and env). The scripts take
 `PYRL_REPO`, `PYRL_PYTHON`, `JOBS`, `MAX_ITER` and `NICE` from the environment, so they run
 unchanged on a Linux box or an Apple Silicon Mac; `tools/launch/README_local_launch.md` covers the
-local launch, the ~96 core-hour budget, the Python 2.7/Theano situation on arm64, and what still
-has to be checked on the Mac:
+local launch, each run's core-hour budget, the Python 2.7/Theano situation on arm64, and what
+still has to be checked on the Mac:
 
 ```bash
 bash tools/launch/launch_weak_start.sh tscost tc55cho 1 2 3 4 5 6 7 8   # one arm
-bash tools/launch/queue_tscost.sh          # the full run: four arms, 720-trial validation
-bash tools/launch/queue_tscost_local.sh    # the slim local run: three arms, NVAL=360
+bash tools/launch/queue_tscost.sh            # the full run: four arms, 720-trial validation
+bash tools/launch/queue_tscost_local.sh      # the slim local run: three arms, NVAL=360
+bash tools/launch/queue_tscost_nopretrain.sh # the no-pre-training control: one arm, max_iter 1000
 MAX_ITER=60 bash tools/launch/smoke_tscost.sh                           # 4 modes x 1 seed, nice'd
 ```
 

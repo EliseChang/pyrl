@@ -112,6 +112,9 @@ ARMS = [("pagan_hist_curriculum_curr_", "pretrained_", "pretrained", "base"),
         # cost, with the duration schedule confined to stage 1
         ("pagan_hist_stages4_g06sc55full_", "stages4_full_", "per-timestep cost 0.55, full stage ladder (stages 1-10)", "e13"),
         ("pagan_hist_stages4_g06sc55short_", "stages4_short_", "per-timestep cost 0.55, stages 1-6 then the full task", "e13"),
+        # the no-pre-training control (17 Oct): straight into the full task, no curriculum at
+        # all, max_iter cut to 1,000 because the collapse is expected from the first checkpoint
+        ("pagan_hist_tscost_g06tl55offctrl_", "tscost_noPretrain_noRamp_", "per-timestep cost 0.55, no pre-training, no duration schedule (control, max_iter 1000)", "e14"),
         # stage curriculum on the effort v2 network (EFFORT 0.55, pre-trained): the rats' TaskSwitch stages
         ("pagan_hist_stages_st55short_", "stages1-6_effort0.55_", "stages 1-6 then full task (effort 0.55)", "stages"),
         ("pagan_hist_stages_st55full_", "stages1-10_effort0.55_", "stages 1-10 with quadrant anti-bias (effort 0.55)", "stages"),
@@ -357,6 +360,23 @@ CLASSES += [
         And the quadrant reward scaling multiplies the terminal reward by 4 x p(quadrant) while the engagement cost
         is charged separately on earlier timesteps, so an attempted correct trial in stages 7-10 nets 4p - 0.55,
         negative for a rare quadrant: the expected value of engaging varies by quadrant there.</p>""",
+        findings="""<p>Not yet run.</p>""")),
+    ("e14", "14. No pre-training, no duration schedule (control)", dict(
+        description="""<p><b>What it gets.</b> The same per-timestep cost as types 11-13 - a decline output at
+        every timestep, 0.55/130 charged per engaged timestep, no fixation requirement - but with no nose-poke
+        pre-training, no stage ladder and no duration schedule: the presentation window is the full 1,300 ms from
+        the very first trial. This is the control deferred from the first run's requirements ("comparison with no
+        pre-training ... is deferred for following runs"), and it isolates what the pre-training window and the
+        duration schedule are actually buying the other arms.</p>
+        <p><b>Why max_iter is cut to 1,000.</b> At initialisation P(DECLINE) is 1/4 per timestep, so
+        P(reaching a potent choice) = 0.75^130 is astronomically small, and there is neither a pre-training phase
+        to learn to hold a short fixation in nor a schedule to grow the window gradually - so every seed is
+        expected to collapse to zero engagement from the first checkpoint and stay there. Confirmed in a 40-update
+        smoke: P(choice) = 0.000 from update 0, essentially all of it mid-window withdrawal at a constant median
+        step of 3. Running the full 2,800-update budget would not add information, so it is cut to 1,000 and
+        n_validation is left at the model's own default (720) for a well-resolved trajectory.</p>
+        <p class="caveat">A network that never engages is the expected, correct result here, not a failure of the
+        model or the run.</p>""",
         findings="""<p>Not yet run.</p>"""))]
 
 CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
@@ -370,7 +390,7 @@ CLASS_OF_ARM = {a: c for _, _, a, c in ARMS}
 # archive.html, and only the runs of its own classes.
 # -----------------------------------------------------------------------------------------
 
-ELISE_KEYS = ("e11", "e12", "e13")
+ELISE_KEYS = ("e11", "e12", "e13", "e14")
 MAIN_KEYS = tuple(k for k, _, _ in CLASSES if k not in ELISE_KEYS)
 
 TREES = {
